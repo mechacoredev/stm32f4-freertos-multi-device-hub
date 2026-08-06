@@ -1,0 +1,30 @@
+# STM32CubeIDE build output
+/Debug/
+/Release/
+*.elf
+*.hex
+*.bin
+*.map
+*.list
+*.o
+*.d
+*.su
+*.cyclo
+*.stackdump
+
+# Local debugger and IDE state
+*.launch
+.settings/com.st.stm32cube.ide.mcu.sfrview.prefs
+.metadata/
+RemoteSystemsTempFiles/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+*~
+
+# Operating-system files
+.DS_Store
+Thumbs.db
+desktop.ini
