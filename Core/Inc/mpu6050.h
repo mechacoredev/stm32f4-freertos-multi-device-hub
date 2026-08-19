@@ -171,6 +171,7 @@ void mpu6050_irq_handler(void);
 void mpu6050_set_active_irq_device(mpu6050_handle_t dev);
 extern volatile uint32_t mpu6050_irq_count;
 mpu6050_return_status mpu6050_get_values(mpu6050_handle_t dev);
+extern volatile uint8_t g_mpu6050_raw_debug[14];
 void mpu6050_get_accel_g(mpu6050_handle_t dev, float* out_xyz);
 void mpu6050_get_gyro_dps(mpu6050_handle_t dev, float* out_xyz);
 

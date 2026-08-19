@@ -1,65 +1,116 @@
-# LL Multi Device Pin Map
+# Pin Map — Current Full Configuration
 
-Target board: STM32F407G-DISC1 / MB997, STM32F407VGT6 (LQFP100).
+Target board: STM32F407G-DISC1 / STM32F407VGTx.
 
-The P1/P2 positions below follow the official MB997 board schematic. All
-external modules use 3.3 V logic and must share GND with the Discovery board.
+This file reflects the current `.ioc` configuration. It supersedes the older map that placed the ILI9341 displays on SPI2.
 
-## I2C1 — BME280 and MPU6050
+## I2C1
 
-| Signal | MCU pin | Header | Configuration |
-|---|---:|---:|---|
-| I2C1 SCL | PB6 | P2-23 | AF4, open-drain, pull-up |
-| I2C1 SDA | PB7 | P2-24 | AF4, open-drain, pull-up |
-| MPU6050 INT | PB1 | P2-21 | EXTI1, rising edge, pull-down |
+| Signal | STM32F407 pin | Connected devices |
+|---|---|---|
+| I2C1_SCL | PB6 | BME280 SCL, MPU6500 SCL |
+| I2C1_SDA | PB7 | BME280 SDA, MPU6500 SDA |
+| MPU6500 interrupt | PB1 | MPU6500 INT |
+
+Both SDA and SCL require pull-up resistors to 3.3 V. Some breakout boards already include them; measure the effective resistance before adding more.
 
 ## SPI1 — RC522 and nRF24L01 RX
 
-| Signal | MCU pin | Header | Configuration |
-|---|---:|---:|---|
-| SPI1 SCK | PB3 | P2-28 | AF5, push-pull |
-| SPI1 MISO | PB4 | P2-25 | AF5 |
-| SPI1 MOSI | PB5 | P2-26 | AF5, push-pull |
-| RC522 CS | PD6 | P2-30 | Output, initial high |
-| RC522 RST | PD7 | P2-27 | Output, initial high |
-| RC522 IRQ | PD3 | P2-31 | EXTI3, falling edge, pull-up |
-| nRF RX CSN | PD1 | P2-33 | Output, initial high |
-| nRF RX CE | PD0 | P2-36 | Output, initial low |
-| nRF RX IRQ | PD2 | P2-34 | EXTI2, falling edge, pull-up |
+Shared bus:
 
-## SPI2 — ILI9341 displays
-
-| Signal | MCU pin | Header | Configuration |
-|---|---:|---:|---|
-| SPI2 SCK | PB13 | P1-37 | AF5, push-pull |
-| SPI2 MISO | PB14 | P1-38 | AF5 |
-| SPI2 MOSI | PB15 | P1-39 | AF5, push-pull |
-| TFT1 DC | PE10 | P1-28 | Output, initial low |
-| TFT1 RST | PE11 | P1-29 | Output, initial high |
-| TFT1 CS | PE12 | P1-30 | Output, initial high |
-| TFT2 DC | PE13 | P1-31 | Output, initial low |
-| TFT2 RST | PE14 | P1-32 | Output, initial high |
-| TFT2 CS | PE15 | P1-33 | Output, initial high |
-
-## SPI3 — nRF24L01 TX
-
-| Signal | MCU pin | Header | Configuration |
-|---|---:|---:|---|
-| SPI3 SCK | PC10 | P2-37 | AF6, push-pull |
-| SPI3 MISO | PC11 | P2-38 | AF6 |
-| SPI3 MOSI | PC12 | P2-35 | AF6, push-pull |
-| nRF TX CSN | PC8 | P2-45 | Output, initial high |
-| nRF TX CE | PC9 | P2-46 | Output, initial low |
-| nRF TX IRQ | PC6 | P2-47 | EXTI6, falling edge, pull-up |
-
-## Enabled interrupt groups
-
-| IRQ | Device signal |
+| Signal | STM32F407 pin |
 |---|---|
-| EXTI1_IRQn | MPU6050 INT (PB1) |
-| EXTI2_IRQn | nRF24L01 RX IRQ (PD2) |
-| EXTI3_IRQn | RC522 IRQ (PD3) |
-| EXTI9_5_IRQn | nRF24L01 TX IRQ (PC6) |
+| SPI1_SCK | PB3 |
+| SPI1_MISO | PB4 |
+| SPI1_MOSI | PB5 |
 
-All EXTI and DMA interrupt priorities are 5, which is compatible with the
-FreeRTOS ISR-safe notification calls used by this project.
+Device control:
+
+| Device | CS/CSN | CE | IRQ / other |
+|---|---|---|---|
+| RC522 | PD6 | — | RST PD7, IRQ PD3 |
+| nRF24L01 RX | PD1 | PD0 | PD2 |
+
+Only one CS/CSN may be active at a time.
+
+## SPI3 — nRF24L01 TX and two ILI9341 displays
+
+Shared bus:
+
+| Signal | STM32F407 pin |
+|---|---|
+| SPI3_SCK | PC10 |
+| SPI3_MISO | PC11 |
+| SPI3_MOSI | PC12 |
+
+Device control:
+
+| Device | CS/CSN | CE | DC | RST | IRQ |
+|---|---|---|---|---|---|
+| nRF24L01 TX | PC8 | PC9 | — | — | PC6 |
+| ILI9341 TFT1 | PE12 | — | PE10 | PE11 | — |
+| ILI9341 TFT2 | PE15 | — | PE13 | PE14 | — |
+
+The TFTs are **not** on PB13/PB14/PB15 in this revision. Those pins conflicted with CAN2.
+
+## CAN2 and SN65HVD230
+
+STM32F407 side:
+
+| Signal | STM32F407 pin | SN65HVD230 pin |
+|---|---|---|
+| CAN2_TX | PB13 | CTX / TXD |
+| CAN2_RX | PB12 | CRX / RXD |
+| 3.3 V | 3V3 | VCC |
+| Ground | GND | GND |
+
+Physical bus:
+
+| F407 transceiver | F103 transceiver |
+|---|---|
+| CANH | CANH |
+| CANL | CANL |
+| GND | GND |
+
+Use one 120-ohm termination resistor across CANH/CANL at each physical end of the bus. Do not add termination at every node.
+
+CAN2 is configured for 500 kbit/s. The F103 node must use matching nominal bit timing.
+
+## DMA mapping
+
+| Peripheral direction | DMA mapping |
+|---|---|
+| I2C1 RX | DMA1 Stream 0 |
+| SPI1 RX | DMA2 Stream 0 |
+| SPI1 TX | DMA2 Stream 3 |
+| SPI3 RX | DMA1 Stream 2 |
+| SPI3 TX | DMA1 Stream 5 |
+
+The current I2C implementation uses RX DMA; I2C TX DMA is not implemented.
+
+## Enabled interrupts
+
+All RTOS-aware peripheral IRQs are configured at preemption priority 5, subpriority 0.
+
+- EXTI1: MPU6500 interrupt on PB1
+- EXTI2: nRF24L01 RX interrupt on PD2
+- EXTI3: RC522 interrupt on PD3
+- EXTI9_5: nRF24L01 TX interrupt on PC6
+- I2C1 event and error
+- SPI1
+- SPI3
+- DMA1 Stream 0, 2 and 5
+- DMA2 Stream 0 and 3
+- CAN2 TX
+- CAN2 RX0
+- CAN2 RX1
+- CAN2 SCE
+
+## Power and grounding checklist
+
+- Connect all module grounds, both MCU grounds and both transceiver grounds.
+- Use 3.3 V logic for STM32F407 GPIO.
+- Check each breakout board’s regulator/level-shifter arrangement before applying 5 V.
+- Give nRF24L01 modules local decoupling close to VCC/GND.
+- Keep SPI and I2C jumpers short during initial validation.
+- Power off before moving signal wires.

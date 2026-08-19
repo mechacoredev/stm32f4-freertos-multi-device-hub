@@ -1,193 +1,202 @@
-# Fault-Tolerant STM32F4 Multi-Device Sensor Hub
+# Fault-Tolerant STM32F4 Multi-Device Hub
 
-An STM32F407 firmware project that coordinates multiple I2C and SPI devices
-under FreeRTOS using STM32 LL drivers, interrupt-driven state machines, DMA,
-centralized bus arbitration, runtime diagnostics, bus recovery, and an
-independent hardware watchdog.
+Register/LL-level STM32F407 firmware that operates I2C, SPI and Classic CAN devices concurrently under FreeRTOS. The project is a learning and validation platform for non-blocking peripheral drivers, interrupt-driven execution, DMA, fault diagnosis and bus recovery.
 
-The project focuses on concurrency, failure handling, and observability rather
-than simply supporting a large number of sensors.
+The current full configuration contains:
 
-## Hardware
+| Interface | Devices / node | Execution model |
+|---|---|---|
+| I2C1 | BME280, MPU6500 | Event/error IRQ state machine; RX data phase uses DMA |
+| SPI1 | RC522, nRF24L01 RX | Interrupt/DMA transfers with device-specific chip select |
+| SPI3 | nRF24L01 TX, ILI9341 TFT1, ILI9341 TFT2 | Shared bus, separate CS pins, interrupt/DMA transfers |
+| CAN2 | STM32F103 node through two SN65HVD230 transceivers | Register-level bxCAN, TX/RX/error interrupts |
 
-- STM32F407G-DISC1 (STM32F407VGT6)
-- BME280 environmental sensor on I2C1
-- MPU6050/MPU6500 inertial sensor on I2C1 with a data-ready interrupt
-- RC522 RFID reader on SPI1
-- nRF24L01 receiver on SPI1
-- nRF24L01 transmitter on SPI3
-- Two ILI9341 displays on SPI2
+The STM32F103 test node is kept intentionally simple and uses HAL. The STM32F407 side is the system under study.
 
-All external modules use 3.3 V logic and share a common ground. The complete
-connection table is available in [PIN_MAP.md](PIN_MAP.md).
+## Design goals
+
+- Keep sensor tasks independent from peripheral register access.
+- Serialize devices sharing one physical bus while allowing different peripherals to operate concurrently.
+- Avoid polling loops in normal runtime data transfers.
+- Record which source, operation, address or CAN ID last succeeded or failed.
+- Attempt local peripheral/bus recovery before considering a whole-MCU reset.
+- Keep reset permission explicit through `is_mcu_reset_allowed`.
+- Expose useful state through STM32CubeIDE Live Expressions.
 
 ## Architecture
 
 ```mermaid
-flowchart TD
-    Sensors[Device tasks] -->|transaction descriptors| Queues[I2C and SPI queues]
-    Queues --> Dispatchers[Central dispatcher tasks]
-    Dispatchers --> Managers[Per-bus managers]
-    Managers --> I2C[I2C event state machine and RX DMA]
-    Managers --> SPI[SPI full-duplex DMA or bounded polling]
-    I2C --> Notify[Task flags and explicit results]
-    SPI --> Notify
-    Notify --> Sensors
-    Health[High-priority health supervisor] --> Watchdog[STM32 IWDG]
-    Sensors -->|heartbeats and progress timestamps| Health
-    Managers -->|fault diagnostics and recovery results| Health
+flowchart LR
+    Sensors[Sensor and display tasks] --> I2CQ[I2C job dispatcher]
+    Sensors --> SPIQ[SPI job dispatcher]
+    CANApp[CAN2 task] --> CANM[CAN manager]
+
+    I2CQ --> I2CM[I2C manager]
+    SPIQ --> SPIM[SPI manager]
+
+    I2CM --> I2C1[I2C1 + DMA1]
+    SPIM --> SPI1[SPI1 + DMA2]
+    SPIM --> SPI3[SPI3 + DMA1]
+    CANM --> CAN2[bxCAN2]
+
+    I2C1 --> I2CDevices[BME280 / MPU6500]
+    SPI1 --> SPI1Devices[RC522 / nRF RX]
+    SPI3 --> SPI3Devices[nRF TX / TFT1 / TFT2]
+    CAN2 --> PHY1[SN65HVD230]
+    PHY1 <--> Bus[CANH / CANL]
+    Bus <--> PHY2[SN65HVD230]
+    PHY2 <--> F103[STM32F103 test node]
+
+    I2CM --> Health[System health]
+    SPIM --> Health
+    CANM --> Health
+    Health --> Recovery[Local recovery]
+    Recovery --> Reset[Optional MCU reset]
 ```
 
-Device tasks never start periodic I2C DMA transfers directly. They submit
-immutable job descriptors to a central dispatcher. The dispatcher serializes
-access to each bus, detects DMA stream conflicts, and reports completion or a
-specific error back to the requesting task.
+## Peripheral ownership and concurrency
 
-## Main engineering features
+Each shared peripheral has one software owner:
 
-### Interrupt-driven I2C with DMA
+- Sensor tasks submit jobs and wait for completion flags; they do not manipulate I2C/SPI registers directly.
+- I2C and SPI dispatchers serialize jobs belonging to the same peripheral.
+- I2C1, SPI1, SPI3 and CAN2 can progress independently, so a slow serial bus does not force the CPU or unrelated buses to wait.
+- Interrupt handlers perform only the time-critical hardware work and notify the corresponding task.
 
-Periodic BME280 and MPU6050 reads use an STM32F4 I2C event state machine. The
-event interrupt advances through START, address, register address, repeated
-START, read address, and data phases. DMA moves the payload into memory, while
-sensor conversion and compensation remain in task context.
+## I2C manager
 
-The manager reports NACK, timeout, bus error, arbitration loss, overrun, DMA
-error, and abort conditions separately. Failed transfers are never processed
-as fresh sensor data.
+The I2C1 manager uses an interrupt-driven state machine for START, address, register-address and repeated-START phases. Periodic sensor reads use DMA for the data-register-to-memory portion. The current implementation does **not** claim I2C TX DMA support.
 
-### Centralized SPI ownership
+It handles:
 
-SPI1, SPI2, and SPI3 have independent mutex-protected manager contexts. Long
-payloads and display updates use DMA. Short, bounded register transactions,
-such as RC522 accesses, use polling because DMA setup would cost more than the
-transfer itself.
+- START, ADDR, TXE, RXNE and BTF sequencing
+- 1-byte, 2-byte and multi-byte receive endings
+- ACK/NACK, POS and LAST behavior
+- AF/NACK, bus error, arbitration loss and overrun reporting
+- transfer timeout and abort
+- physical bus recovery by temporarily controlling SCL/SDA when necessary
+- startup and runtime peripheral reinitialization
 
-For full-duplex DMA, RX is enabled before TX. Chip select remains asserted
-until both streams complete and the SPI BSY flag clears.
+## SPI manager
 
-### Deliberate blocking policy
+SPI1 and SPI3 use independent contexts and DMA streams. Multiple devices share clock/data pins but have their own chip-select pins.
 
-The project does not attempt to make every operation non-blocking:
+The manager provides:
 
-- one-time initialization and short register operations use bounded polling;
-- periodic sensor reads and long payloads use interrupts and DMA;
-- every wait has a timeout or an RTOS blocking primitive;
-- no sensor processing is performed inside an ISR.
+- full-duplex clocked transfers
+- interrupt/DMA completion and error reporting
+- per-device CS control
+- timeout/abort handling
+- peripheral recovery
+- post-recovery device validation before a recovery is counted as successful
 
-### I2C stuck-bus recovery
+SPI3 is intentionally shared by nRF24L01 TX and both ILI9341 displays. Serialization prevents their CS windows from overlapping.
 
-If I2C1 remains BUSY, the manager first resets the peripheral. If SDA is still
-held low, GPIO-based recovery generates up to nine SCL pulses followed by an
-explicit STOP condition, restores the pins to AF4 open-drain mode, and retries
-the operation once.
+## CAN manager
 
-Jobs are not requeued forever when physical recovery fails. The error is
-returned to the device task, and the health supervisor eventually stops feeding
-the watchdog if valid data does not resume.
+STM32F4 bxCAN has no ST LL driver in this firmware package, so CAN2 is controlled directly through its registers.
 
-### Health monitoring and watchdog
+Current configuration:
 
-A high-priority supervisor evaluates both task liveness and useful work:
+- Classic CAN at 500 kbit/s
+- standard and extended data/remote frame representation
+- three hardware TX mailboxes
+- RX FIFO0 and FIFO1 interrupt handling
+- software RX ring with peek/release ownership
+- TX, RX0, RX1 and SCE interrupts
+- automatic retransmission and automatic bus-off management
+- CAN2 filter bank 14 configured as accept-all for the present test
+- ACK/progress timeout detection (3 seconds)
+- peripheral reinitialization and recovery diagnostics
 
-- BME280 and MPU6050: age of the last valid measurement;
-- RC522: periodic Version register verification;
-- nRF24L01 TX: age of the last successful TX_DS event;
-- nRF24L01 RX: age of the last completed payload;
-- ILI9341: age of the last successful display DMA operation;
-- all application tasks: heartbeat presence in the monitor window.
+There is no DMA path because bxCAN already owns its TX mailboxes, RX FIFOs, arbitration and frame serialization in hardware.
 
-The independent watchdog starts immediately. A bounded startup grace period
-allows the peripherals to initialize. After the system becomes operational,
-the watchdog is fed only while all required heartbeats and progress checks are
-healthy. The nominal watchdog timeout is approximately five seconds; the exact
-value depends on the internal LSI oscillator tolerance.
+## System health and recovery
 
-The watchdog is frozen while the core is halted by a debugger, so breakpoints
-remain usable.
+`system_health.c` tracks every configured bus with these states:
 
-### FreeRTOS safety hooks
+- `SYSTEM_BUS_STATE_OK`
+- `SYSTEM_BUS_STATE_SUSPECT`
+- `SYSTEM_BUS_STATE_RECOVERING`
+- `SYSTEM_BUS_STATE_FAILED`
 
-- stack-overflow checking with `configCHECK_FOR_STACK_OVERFLOW = 2`;
-- malloc-failed hook;
-- `configASSERT` routed to the fault recorder;
-- runtime stack high-water marks;
-- current and minimum-ever free heap measurements;
-- fatal fault task name and handle capture.
+For each bus, diagnostics include:
 
-## Runtime diagnostics
+- last successful tick and current data age
+- last successful source and operation
+- last address, register or CAN ID
+- last failure and fault age
+- recovery attempt/success/failure counts
+- consecutive failures
+- reset deadline and whether reset was suppressed
 
-Add the following single expression to STM32CubeIDE Live Expressions:
+Recovery success means more than “the reset function returned”: the corresponding sensor/node must produce valid communication again. A whole-MCU reset is permitted only when `is_mcu_reset_allowed` is true.
 
-```c
-g_runtime_debug
-```
+## Useful Live Expressions
 
-It contains I2C line levels and registers, manager recovery counters, queue
-depth, sensor data ages, SPI progress ages, watchdog state, initialization
-state, reset cause, and stale-subsystem information.
+- `bme280_display_data`
+- `mpu6050_display_data`
+- `nrf24l01_display_data`
+- `rc522_display_data`
+- `ili9341_dma_success_count`
+- `ili9341_dma_error_count`
+- `g_can2_debug`
+- `g_can2_last_tx_frame`
+- `g_can2_last_rx_frame`
+- `g_system_bus_health`
+- `is_mcu_reset_allowed`
 
-`stale_subsystem_mask` uses the following bits:
+## Hardware and wiring
 
-| Bit value | Monitored subsystem |
-|---:|---|
-| 1 | BME280 |
-| 2 | MPU6050/MPU6500 |
-| 4 | RC522 |
-| 8 | nRF24L01 TX |
-| 16 | nRF24L01 RX |
-| 32 | ILI9341 display pipeline |
+See [PIN_MAP.md](PIN_MAP.md) before connecting modules. Important points:
+
+- All modules and both CAN nodes need a common ground.
+- CANH/CANL require 120-ohm termination at the two physical ends of the bus.
+- PB12/PB13 are CAN2 RX/TX; the displays therefore use SPI3, not SPI2.
+- SPI3 is shared; each device must use only its own CS pin.
+- Verify the voltage requirements of every breakout board before powering it.
 
 ## Build
 
-1. Open STM32CubeIDE 1.19 or a compatible version.
-2. Import this directory as an existing STM32CubeIDE project.
-3. Open `LL_multi_device.ioc` if pin or RTOS regeneration is required.
-4. Build the Debug configuration.
-5. Flash using the on-board ST-LINK interface.
+The current workspace builds with:
 
-The last locally verified Debug build used GNU Tools for STM32 13.3 and
-completed without compiler warnings:
+- STM32CubeIDE 2.2.0
+- GNU Arm Embedded Toolchain 14.3
+- STM32Cube FW_F4 V1.28.3
+- FreeRTOS through CMSIS-RTOS v2
+
+Latest local Debug build after the full-device re-enable:
 
 ```text
-text: 80,420 bytes
-data:    100 bytes
-bss:  59,076 bytes
+text   89136
+data     100
+bss    60500
+total 149736 bytes
+0 errors, 0 warnings
 ```
 
-Build artifacts are intentionally excluded from version control.
+## Validation status
 
-## Validation performed
+The complete configuration has been exercised on assembled hardware for 15 minutes with all enabled devices operating concurrently. During this run, the BME280, MPU6500, RC522, both nRF24L01 paths, both ILI9341 displays and the STM32F407/STM32F103 CAN link operated as expected without an observed communication failure.
 
-The integrated firmware has been exercised with all listed devices connected.
-Bench fault injection included temporary I2C disconnection, SDA bus lock,
-watchdog recovery, repeated watchdog resets, and nRF24L01 disconnection and
-reconnection. The firmware recovered from transient faults and reset when
-required progress did not resume.
+This is a successful integration/smoke test, not a long-duration endurance or product-qualification test. Multi-hour operation and extended repeated fault injection remain to be documented.
 
-The repeatable validation plan and evidence fields are documented in
-[HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md).
+Use [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) for the staged validation procedure. Do not treat a successful build as proof of electrical or long-duration stability.
 
-## Known limitations
+## Current limitations
 
-- The project is an engineering and learning platform, not certified
-  production firmware.
-- ILI9341 write transfers do not provide an acknowledgement. DMA progress can
-  detect a stalled software pipeline, but it cannot prove that a physically
-  disconnected panel received the pixels without an additional readback path.
-- nRF24L01 RX freshness assumes this demo's paired transmitter sends a packet
-  approximately once per second. A general-purpose receiver must make this
-  policy configurable because silence can be valid behavior.
-- Recovery currently escalates to a full MCU watchdog reset. A production
-  design may attempt per-device reinitialization before resetting the system.
-- Jumper wires and breadboards are not representative of production hardware.
-  Proper decoupling, pull-ups, grounding, and PCB layout remain necessary.
-- Diagnostic counters are stored in normal RAM and are cleared by reset. Only
-  the RCC reset-cause flags survive for the next boot.
+- I2C TX DMA is not implemented.
+- CAN filtering is currently accept-all rather than application-specific.
+- A 15-minute full-load integration test has passed; multi-hour endurance results are not yet recorded.
+- Extended repeated multi-bus fault-injection results are not yet recorded.
+- The project is a development/learning platform, not a certified safety product.
 
-## Project status
+## Repository guide
 
-The current implementation is feature-complete for its learning objective.
-Future work should prioritize repeatable measurements, long-duration stress
-testing, documentation, and a clean-room rewrite rather than adding more
-sensors.
+- `Core/Src/i2c_manager.c`, `Core/Inc/i2c_manager.h`: I2C state machine, DMA receive and recovery
+- `Core/Src/spi_manager.c`, `Core/Inc/spi_manager.h`: SPI DMA manager and recovery
+- `Core/Src/can_manager.c`, `Core/Inc/can_manager.h`: register-level bxCAN manager
+- `Core/Src/system_health.c`, `Core/Inc/system_health.h`: health state and recovery bookkeeping
+- `Core/Src/main.c`: generated initialization, RTOS task wiring and application integration
+- `PIN_MAP.md`: authoritative connection map for this revision
+- `HARDWARE_VALIDATION.md`: hardware test checklist

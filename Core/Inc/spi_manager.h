@@ -22,7 +22,11 @@ typedef enum{
 	_spi_manager_timeout,
 	_spi_manager_size_0,
 	_spi_manager_uninited_struct,
+	_spi_manager_validation_unavailable,
+	_spi_manager_validation_failed,
 }spi_manager_return_status;
+
+typedef bool (*spi_manager_validator_t)(void* context);
 
 typedef struct{
 	SPI_TypeDef* spi_handle;
@@ -46,6 +50,7 @@ typedef struct{
 void spi_manager_assign_bus(SPI_TypeDef* spi_handle, osMutexId_t mutex, osSemaphoreId_t sem);
 void spi_manager_set_dispatch_notification(SPI_TypeDef* spi_handle,
 		osThreadId_t dispatch_task, uint32_t completion_flag);
+spi_manager_return_status spi_manager_register_validator(SPI_TypeDef* spi_handle, spi_manager_validator_t validator, void* context);
 
 // Ham (protokolden bağımsız) full-duplex transfer fonksiyonları
 // txdata ve rxdata aynı 'size' uzunluğunda olmalı. txdata'yı sadece okuma
@@ -59,5 +64,6 @@ bool spi_manager_last_transfer_succeeded(SPI_TypeDef* spi_handle);
 void spi_manager_dma_handler(DMA_TypeDef* dma_handle, uint32_t dma_stream);
 void spi_manager_error_handler(SPI_TypeDef* spi_handle);
 void spi_manager_abort_transfer(SPI_TypeDef* spi_handle);
+spi_manager_return_status spi_manager_recover_bus(SPI_TypeDef* spi_handle);
 
 #endif /* INC_SPI_MANAGER_H_ */

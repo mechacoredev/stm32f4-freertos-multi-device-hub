@@ -7,6 +7,8 @@
 
 #include "spi_manager.h"
 
+#define SPI_MANAGER_MAX_VALIDATORS 4
+
 typedef enum{
 	SPI_DMA_STATE_IDLE = 0,
 	SPI_DMA_STATE_BUSY,
@@ -32,6 +34,9 @@ struct spi_dma_management{
 	volatile bool tx_done;
 	volatile bool rx_done;
 	volatile bool transfer_error;
+	spi_manager_validator_t validators[SPI_MANAGER_MAX_VALIDATORS];
+	void* validator_contexts[SPI_MANAGER_MAX_VALIDATORS];
+	uint8_t validator_count;
 
 	spi_dma_state_t state;
 };
@@ -52,8 +57,25 @@ void spi_manager_assign_bus(SPI_TypeDef* spi_handle, osMutexId_t mutex, osSemaph
 		job->mutexHandle = mutex;
 		job->semaphoreHandle = sem;
 		job->state = SPI_DMA_STATE_IDLE;
+		job->validator_count = 0;
 		LL_SPI_Enable(spi_handle);
 	}
+}
+
+spi_manager_return_status spi_manager_register_validator(SPI_TypeDef* spi_handle, spi_manager_validator_t validator, void* context){
+	struct spi_dma_management* job = get_job(spi_handle);
+	if((job == NULL) || (job->spi_handle == NULL)) return _spi_manager_uninited_struct;
+	if(validator == NULL) return _spi_manager_fail;
+
+	for(uint8_t index = 0; index < job->validator_count; index++){
+		if((job->validators[index] == validator) && (job->validator_contexts[index] == context)) return _spi_manager_ok;
+	}
+
+	if(job->validator_count >= SPI_MANAGER_MAX_VALIDATORS) return _spi_manager_fail;
+	job->validators[job->validator_count] = validator;
+	job->validator_contexts[job->validator_count] = context;
+	job->validator_count++;
+	return _spi_manager_ok;
 }
 
 void spi_manager_set_dispatch_notification(SPI_TypeDef* spi_handle,
@@ -364,4 +386,29 @@ void spi_manager_abort_transfer(SPI_TypeDef* spi_handle){
 	spi_dma_cleanup(job);
 	job->state = SPI_DMA_STATE_IDLE;
 	osMutexRelease(job->mutexHandle);
+}
+
+spi_manager_return_status spi_manager_recover_bus(SPI_TypeDef* spi_handle){
+	struct spi_dma_management* job = get_job(spi_handle);
+	if((job == NULL) || (job->spi_handle == NULL)) return _spi_manager_uninited_struct;
+	if(job->state != SPI_DMA_STATE_IDLE) return _spi_manager_busy;
+	if(osMutexAcquire(job->mutexHandle, spi_manager_timeout_ms) != osOK) return _spi_manager_busy;
+
+	LL_SPI_Disable(spi_handle);
+	if(LL_SPI_IsActiveFlag_OVR(spi_handle)) LL_SPI_ClearFlag_OVR(spi_handle);
+	if(LL_SPI_IsActiveFlag_MODF(spi_handle)) LL_SPI_ClearFlag_MODF(spi_handle);
+	LL_SPI_Enable(spi_handle);
+
+	if(LL_SPI_IsActiveFlag_BSY(spi_handle)){
+		osMutexRelease(job->mutexHandle);
+		return _spi_manager_busy;
+	}
+
+	osMutexRelease(job->mutexHandle);
+	if(job->validator_count == 0) return _spi_manager_validation_unavailable;
+
+	for(uint8_t index = 0; index < job->validator_count; index++){
+		if(!job->validators[index](job->validator_contexts[index])) return _spi_manager_validation_failed;
+	}
+	return _spi_manager_ok;
 }

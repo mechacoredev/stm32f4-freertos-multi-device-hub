@@ -60,6 +60,7 @@ typedef struct nrf24l01_t* nrf24l01_handle_t;
 
 // Kullanılacak Fonksiyon Prototipleri
 nrf24l01_handle_t nrf24l01_init(nrf24l01_user_configs* config);
+bool nrf24l01_validate(nrf24l01_handle_t dev);
 
 // DMA Tabanlı Asenkron Veri Transferleri
 nrf24l01_return_status nrf24l01_send_dma(nrf24l01_handle_t dev, uint8_t *data, uint8_t length);

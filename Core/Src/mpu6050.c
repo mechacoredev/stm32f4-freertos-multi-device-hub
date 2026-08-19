@@ -168,8 +168,14 @@ mpu6050_return_status mpu6050_find_or_check_device(mpu6050_user_configs* config)
 	return _mpu6050_device_not_found;
 }
 
+volatile uint8_t g_mpu6050_raw_debug[14];
+
 mpu6050_return_status mpu6050_get_values(mpu6050_handle_t dev){
 	if(dev->is_this_device_safe_to_use != true) return _mpu6050_not_safe_to_use;
+
+	for(uint8_t index = 0; index < 14; index++){
+		g_mpu6050_raw_debug[index] = dev->raw_data[index];
+	}
 
 	dev->accel_raw[0] = (int16_t)((dev->raw_data[0] << 8) | dev->raw_data[1]);
 	dev->accel_raw[1] = (int16_t)((dev->raw_data[2] << 8) | dev->raw_data[3]);

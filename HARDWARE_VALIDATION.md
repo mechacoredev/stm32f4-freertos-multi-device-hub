@@ -1,104 +1,150 @@
 # Hardware Validation Checklist
 
-Do not mark an item complete from code inspection alone. Record the firmware
-revision, wiring, power supply, observed result, and failure evidence.
+Use this checklist in order. A clean build is only the starting point; each stage must be observed on hardware before the next one is trusted.
 
-## 1. Full-system baseline
+## 1. Pre-power inspection
 
-- [ ] Build and flash the current Debug image.
-- [ ] Confirm every `*_initialized` field in `g_runtime_debug` is true.
-- [ ] Confirm `normal_monitoring_started == true`.
-- [ ] Confirm `stale_subsystem_mask == 0`.
-- [ ] Confirm all sensor values and display fields update.
-- [ ] Run the complete system for at least one hour without an unexpected
-      reset.
+- [ ] Confirm the wiring against [PIN_MAP.md](PIN_MAP.md).
+- [ ] Confirm common ground between all modules, STM32F407, STM32F103 and both CAN transceivers.
+- [ ] Check for shorts between 3.3 V, 5 V and ground.
+- [ ] Confirm I2C pull-ups and idle-high SDA/SCL.
+- [ ] Confirm every SPI device has a unique CS/CSN.
+- [ ] Confirm SPI3 TFT/nRF TX wiring; do not use the obsolete SPI2 TFT pin map.
+- [ ] Confirm CANH-to-CANH and CANL-to-CANL.
+- [ ] Confirm exactly two 120-ohm CAN termination resistors at the physical ends.
+- [ ] Confirm both CAN nodes use 500 kbit/s timing.
 
-Record:
+## 2. Baseline startup
 
-- `monitor_cycle_count`
-- `watchdog_feed_count`
-- `missing_heartbeat_mask`
-- `minimum_free_stack_words[]`
-- `free_heap_bytes`
-- `minimum_ever_free_heap_bytes`
+Start with `is_mcu_reset_allowed = false` so diagnostics remain visible instead of immediately rebooting.
 
-## 2. I2C protocol and DMA
+- [ ] Flash the STM32F103 CAN test firmware.
+- [ ] Start the STM32F407 Debug build.
+- [ ] Confirm every enabled task reaches its normal loop.
+- [ ] Confirm no HardFault, assert or unexpected reset.
+- [ ] Confirm `g_system_bus_health` entries settle to `SYSTEM_BUS_STATE_OK`.
+- [ ] Record startup time and any initial recovery attempt.
 
-- [ ] Capture START, write address, register address, repeated START, read
-      address, payload, and STOP using a logic analyzer.
-- [ ] Verify the BME280 payload length.
-- [ ] Verify the MPU6050/MPU6500 14-byte payload.
-- [ ] Confirm the event ISR only advances bounded states.
-- [ ] Confirm the DMA completion path wakes the dispatcher.
-- [ ] Confirm failed transfers do not increment valid-data counters.
+## 3. I2C1 validation
 
-## 3. I2C fault injection
+Observe:
 
-- [ ] Temporarily disconnect BME280 SDA and reconnect it.
-- [ ] Temporarily disconnect MPU6050/MPU6500 SDA and reconnect it.
-- [ ] Hold SDA low and confirm BUSY detection.
-- [ ] Confirm peripheral software reset is attempted.
-- [ ] Confirm up to nine SCL recovery pulses and an explicit STOP are generated.
-- [ ] Confirm `physical_recovery_count` changes.
-- [ ] Confirm `physical_recovery_success_count` changes after a recoverable
-      fault.
-- [ ] Confirm a persistent fault sets the relevant stale bit and stops watchdog
-      feeding.
-- [ ] Confirm a watchdog reset occurs and the next boot reports
-      `last_reset_was_watchdog == true`.
+- `bme280_display_data`
+- `mpu6050_display_data`
+- the I2C1 entry in `g_system_bus_health`
 
-## 4. SPI and device progress
+Tests:
 
-- [ ] Verify SPI chip select falls before the first clock and rises after the
-      final bit.
-- [ ] Confirm both RX and TX DMA streams complete for full-duplex jobs.
-- [ ] Confirm RC522 Version register checks continue when no RFID card is
-      present.
-- [ ] Disconnect RC522 and verify stale bit 4.
-- [ ] Disconnect nRF24L01 TX and verify stale bit 8; bit 16 may also appear
-      because RX stops receiving packets.
-- [ ] Disconnect nRF24L01 RX and verify the expected TX/RX dependency failure.
-- [ ] Confirm temporary radio disconnection can recover after reconnection.
-- [ ] Confirm persistent radio failure eventually causes a watchdog reset.
+- [ ] BME280 temperature, pressure and humidity update continuously.
+- [ ] MPU6500 all three accelerometer and all three gyroscope axes update.
+- [ ] Both sources appear in health diagnostics over time.
+- [ ] Data ages remain bounded during normal operation.
+- [ ] No recurring AF, bus error, arbitration loss or timeout.
 
-ILI9341 note: a write-only SPI transfer has no panel acknowledgement. Verify
-the DMA pipeline and task progress, but do not claim that this proves physical
-panel presence.
+Fault injection:
 
-## 5. RTOS resource tests
+1. Record the normal counters.
+2. Disconnect SCL or one sensor connection briefly.
+3. Confirm the bus becomes suspect/failed.
+4. Reconnect the wire.
+5. Confirm a recovery attempt occurs.
+6. Count recovery as successful only after valid sensor data updates again.
+7. If recovery does not restore data, confirm failure count increases.
+8. With reset permission still false, confirm reset is reported as suppressed after the deadline.
+9. Repeat once with reset permission true only after the local recovery behavior is understood.
 
-- [ ] Record the minimum free stack words for every task after at least one
-      hour.
-- [ ] Confirm no queue stays permanently full.
-- [ ] Confirm no mutex remains owned after transfer timeout or abort.
-- [ ] Confirm the high-priority health task advances once per second under
-      heavy I2C and SPI load.
-- [ ] Trigger the stack-overflow hook in a temporary test build.
-- [ ] Trigger the malloc-failed hook in a temporary test build.
-- [ ] Restore safe settings after destructive tests.
+## 4. SPI1 validation
 
-## 6. Reset and startup tests
+Devices: RC522 and nRF24L01 RX.
 
-- [ ] Perform at least 20 cold power cycles.
-- [ ] Perform repeated watchdog resets with all devices connected.
-- [ ] Introduce a fault immediately after a watchdog reset and verify the
-      bounded startup grace behavior.
-- [ ] Confirm the debugger freezes IWDG while the core is suspended.
-- [ ] Confirm standalone operation resets without debugger intervention.
+- [ ] RC522 operations complete and its display/debug data updates.
+- [ ] nRF24L01 RX receives packets.
+- [ ] CS/CSN lines never overlap.
+- [ ] DMA/IRQ success counts increase without error growth.
+- [ ] Disconnect and reconnect each device separately.
+- [ ] Confirm SPI recovery is followed by device-level validation.
+- [ ] Do not count a peripheral reset alone as a successful recovery.
 
-## Test record template
+## 5. SPI3 shared-bus validation
 
-```text
-Date:
-Firmware revision:
-Board and wiring:
-Power supply:
-Logic analyzer and sample rate:
-Test case:
-Expected result:
-Observed result:
-Pass or fail:
-Diagnostic values:
-Screenshot or trace:
-Notes:
-```
+Devices: nRF24L01 TX, ILI9341 TFT1 and ILI9341 TFT2.
+
+- [ ] nRF TX packets continue while both displays refresh.
+- [ ] TFT1 and TFT2 show their intended content.
+- [ ] `ili9341_dma_success_count` increases.
+- [ ] `ili9341_dma_error_count` remains stable.
+- [ ] No display corruption appears during nRF traffic.
+- [ ] Logic-analyzer capture confirms only one CS/CSN is low at a time.
+- [ ] Disconnect one SPI3 device and confirm the other clients remain diagnosable.
+
+## 6. CAN2 validation
+
+Observe:
+
+- `g_can2_debug`
+- `g_can2_last_tx_frame`
+- `g_can2_last_rx_frame`
+- the CAN2 entry in `g_system_bus_health`
+
+Baseline:
+
+- [ ] F407 TX request and TX complete counts increase.
+- [ ] F103 receives F407 frames.
+- [ ] F407 RX IRQ/received/processed counts increase from F103 frames.
+- [ ] Last TX/RX IDs, DLC and payloads match expectations.
+- [ ] No warning, error-passive or bus-off counters increase.
+
+Fault injection:
+
+- [ ] Disconnect or power down the F103 node.
+- [ ] Confirm missing ACK/progress is detected within the configured 3-second window.
+- [ ] Confirm CAN recovery attempts are recorded.
+- [ ] Restore the node and confirm RX/TX progress resumes.
+- [ ] Confirm recovery success is recorded only after real CAN progress.
+- [ ] Temporarily remove one termination resistor and record error behavior; restore it immediately after the test.
+
+## 7. Full simultaneous-load test
+
+Current result: **Passed for 15 minutes** with the complete connected configuration. All enabled devices operated as expected during that observation window. The individual evidence items below should still be retained for repeatable future test records.
+
+- [ ] Enable all sensor, radio, display and CAN tasks.
+- [ ] Run I2C1, SPI1, SPI3 and CAN2 concurrently.
+- [ ] Confirm every source update count increases.
+- [ ] Confirm maximum data ages stay within their intended periods.
+- [ ] Confirm RTOS tasks continue producing health heartbeats.
+- [ ] Confirm no queue/ring overflow.
+- [ ] Confirm no DMA stream remains permanently active.
+- [ ] Confirm no unexpected recovery loop.
+- [ ] Capture a logic-analyzer trace for I2C and both SPI buses.
+- [ ] Capture CAN traffic or at least both-node counters and last frames.
+
+## 8. Endurance
+
+The final duration is a project decision; one hour is a useful development checkpoint, not a product-qualification test.
+
+Current result: the 15-minute integration run passed. The one-hour and longer-duration checks below remain pending.
+
+- [ ] Run the complete system for at least one hour without breakpoints.
+- [ ] Record start/end counters and data ages.
+- [ ] Record all recovery attempts and their verified outcomes.
+- [ ] Verify no counter stops unexpectedly.
+- [ ] Verify displays remain responsive.
+- [ ] Verify CAN communication remains bidirectional.
+- [ ] Repeat after a warm debugger restart and after a full power cycle.
+
+## Result record
+
+For every test, save:
+
+- firmware commit/revision
+- wiring revision
+- power source
+- test duration
+- enabled tasks
+- initial/final diagnostic snapshots
+- logic-analyzer/CAN captures
+- observed fault
+- recovery action
+- whether valid communication actually resumed
+
+Do not mark the complete system validated until the simultaneous-load and fault-injection stages have both passed.

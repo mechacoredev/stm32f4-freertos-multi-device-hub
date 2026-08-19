@@ -29,6 +29,7 @@
 #include "ili9341.h"
 #include "system_health.h"
 #include "string.h"
+#include "can_manager.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -194,6 +195,9 @@ typedef struct{
 #define NRF_PROGRESS_STALE_TIMEOUT_MS 4000
 #define DISPLAY_PROGRESS_STALE_TIMEOUT_MS 2000
 #define WATCHDOG_STARTUP_GRACE_MS 5000
+#define BUS_RECOVERY_RETRY_PERIOD_MS 1000
+#define BUS_RECOVERY_RESET_TIMEOUT_MS 30000
+#define CAN_ACK_TIMEOUT_MS 3000
 #define SENSOR_STALE_BME280_MASK 0x01
 #define SENSOR_STALE_MPU6050_MASK 0x02
 #define SPI_STALE_RC522_MASK 0x04
@@ -201,6 +205,17 @@ typedef struct{
 #define SPI_STALE_NRF_RX_MASK 0x10
 #define SPI_STALE_DISPLAY_MASK 0x20
 
+/* 0: tum cihazlar aktif, 1: yalnizca I2C1 uzerindeki BME280/MPU6500 ve CAN2. */
+#define REDUCED_I2C_CAN_TEST 0
+
+#if REDUCED_I2C_CAN_TEST
+#define ACTIVE_HEALTH_MASK \
+  (SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_BME280) | \
+   SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_MPU6050) | \
+   SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_I2C_DISPATCH) | \
+   SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_CAN_RX) | \
+   SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_CAN_TX))
+#else
 #define ACTIVE_HEALTH_MASK \
   (SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_BME280) | \
    SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_MPU6050) | \
@@ -209,7 +224,10 @@ typedef struct{
    SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_SPI_DISPATCH) | \
    SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_NRF_TX) | \
    SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_NRF_RX) | \
-   SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_DISPLAY))
+   SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_DISPLAY) | \
+   SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_CAN_RX) | \
+   SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_CAN_TX))
+#endif
 
 /* USER CODE END PD */
 
@@ -219,6 +237,7 @@ typedef struct{
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+CAN_HandleTypeDef hcan2;
 
 /* Definitions for bme280task */
 osThreadId_t bme280taskHandle;
@@ -282,6 +301,20 @@ const osThreadAttr_t healthtask_attributes = {
   .name = "healthtask",
   .stack_size = 256 * 4,
   .priority = (osPriority_t) osPriorityHigh,
+};
+/* Definitions for CAN2ReadTask */
+osThreadId_t CAN2ReadTaskHandle;
+const osThreadAttr_t CAN2ReadTask_attributes = {
+  .name = "CAN2ReadTask",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityAboveNormal,
+};
+/* Definitions for CAN2WriteTask */
+osThreadId_t CAN2WriteTaskHandle;
+const osThreadAttr_t CAN2WriteTask_attributes = {
+  .name = "CAN2WriteTask",
+  .stack_size = 256 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
 };
 /* Definitions for i2c_job_queue */
 osMessageQueueId_t i2c_job_queueHandle;
@@ -438,7 +471,7 @@ static void MX_DMA_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_SPI3_Init(void);
-static void MX_SPI2_Init(void);
+static void MX_CAN2_Init(void);
 void startbme280task(void *argument);
 void starti2cdmatask(void *argument);
 void startrc522task(void *argument);
@@ -448,6 +481,8 @@ void startnrf24l01TXtask(void *argument);
 void startnrf24l01RXtask(void *argument);
 void startili9341task(void *argument);
 void starthealthtask(void *argument);
+void StartCAN2ReadTask(void *argument);
+void StartCAN2WriteTask(void *argument);
 
 /* USER CODE BEGIN PFP */
 
@@ -484,11 +519,25 @@ static void refresh_i2c_dma_debug(i2c_dispatch_slot_t* active_jobs);
 static void refresh_spi_dma_debug(spi_dispatch_slot_t* active_jobs);
 static void refresh_runtime_debug(uint32_t now,
         uint32_t stale_sensor_mask);
+static bool validate_rc522_spi(void* context);
+static bool validate_nrf24_spi(void* context);
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+static bool validate_rc522_spi(void* context){
+  rc522_handle_t device = (rc522_handle_t)context;
+  if(device == NULL) return false;
+
+  uint8_t version = rc522_get_version(device);
+  return (version != 0) && (version != 0xFF);
+}
+
+static bool validate_nrf24_spi(void* context){
+  return nrf24l01_validate((nrf24l01_handle_t)context);
+}
 
 static int8_t get_i2c_dispatch_index(I2C_TypeDef* i2c_handle){
   if(i2c_handle == I2C1) return 0;
@@ -652,8 +701,12 @@ static void refresh_runtime_debug(uint32_t now,
   g_runtime_debug.i2c1.sr2 = I2C1->SR2;
   g_runtime_debug.i2c1.cr1 = I2C1->CR1;
   g_runtime_debug.i2c1.cr2 = I2C1->CR2;
-  g_runtime_debug.i2c1.queue_depth = i2c_job_queueHandle == NULL ? 0 :
-          osMessageQueueGetCount(i2c_job_queueHandle);
+  if(i2c_job_queueHandle == NULL){
+    g_runtime_debug.i2c1.queue_depth = 0;
+  }else{
+    g_runtime_debug.i2c1.queue_depth =
+            osMessageQueueGetCount(i2c_job_queueHandle);
+  }
   g_runtime_debug.i2c1.dma_active_count = i2c_dma_active_count;
   g_runtime_debug.i2c1.busy_requeue_count =
           i2c1_runtime_busy_requeue_count;
@@ -683,24 +736,30 @@ static void refresh_runtime_debug(uint32_t now,
           manager->bus_free_after_cleanup;
 
   g_runtime_debug.bme280_update_count = bme280_display_data.update_count;
-  g_runtime_debug.bme280_data_age_ms = now - bme280_last_success_tick;
+  if(bme280_last_success_tick == 0) g_runtime_debug.bme280_data_age_ms = UINT32_MAX;
+  else g_runtime_debug.bme280_data_age_ms = now - bme280_last_success_tick;
   g_runtime_debug.mpu6050_update_count = mpu6050_display_data.update_count;
-  g_runtime_debug.mpu6050_data_age_ms = now - mpu6050_last_success_tick;
+  if(mpu6050_last_success_tick == 0) g_runtime_debug.mpu6050_data_age_ms = UINT32_MAX;
+  else g_runtime_debug.mpu6050_data_age_ms = now - mpu6050_last_success_tick;
   g_runtime_debug.mpu6050_dma_success_count = mpu6050_dma_success_count;
   g_runtime_debug.mpu6050_dma_error_count = mpu6050_dma_error_count;
   g_runtime_debug.mpu6050_queue_error_count = mpu6050_queue_error_count;
-  g_runtime_debug.rc522_liveness_age_ms = now - rc522_last_liveness_tick;
+  if(rc522_last_liveness_tick == 0) g_runtime_debug.rc522_liveness_age_ms = UINT32_MAX;
+  else g_runtime_debug.rc522_liveness_age_ms = now - rc522_last_liveness_tick;
   g_runtime_debug.rc522_liveness_error_count =
           rc522_liveness_error_count;
   g_runtime_debug.rc522_expected_version = rc522_version;
   g_runtime_debug.rc522_last_observed_version =
           rc522_last_observed_version;
-  g_runtime_debug.nrf_tx_success_age_ms = now - nrf_tx_last_success_tick;
+  if(nrf_tx_last_success_tick == 0) g_runtime_debug.nrf_tx_success_age_ms = UINT32_MAX;
+  else g_runtime_debug.nrf_tx_success_age_ms = now - nrf_tx_last_success_tick;
   g_runtime_debug.nrf_tx_success_count = nrf_tx_success_count;
   g_runtime_debug.nrf_tx_error_count = nrf_tx_error_count;
-  g_runtime_debug.nrf_rx_success_age_ms = now - nrf_rx_last_success_tick;
+  if(nrf_rx_last_success_tick == 0) g_runtime_debug.nrf_rx_success_age_ms = UINT32_MAX;
+  else g_runtime_debug.nrf_rx_success_age_ms = now - nrf_rx_last_success_tick;
   g_runtime_debug.nrf_rx_packet_count = nrf_rx_packet_count;
-  g_runtime_debug.ili9341_success_age_ms = now - ili9341_last_success_tick;
+  if(ili9341_last_success_tick == 0) g_runtime_debug.ili9341_success_age_ms = UINT32_MAX;
+  else g_runtime_debug.ili9341_success_age_ms = now - ili9341_last_success_tick;
   g_runtime_debug.ili9341_dma_success_count = ili9341_dma_success_count;
   g_runtime_debug.ili9341_dma_error_count = ili9341_dma_error_count;
   g_runtime_debug.stale_sensor_mask = stale_mask &
@@ -1178,7 +1237,7 @@ int main(void)
   MX_I2C1_Init();
   MX_SPI1_Init();
   MX_SPI3_Init();
-  MX_SPI2_Init();
+  MX_CAN2_Init();
   /* USER CODE BEGIN 2 */
   i2c1_startup_sr2_after = I2C1->SR2;
   i2c1_startup_recovery_success = i2c1_startup_recovery_success &&
@@ -1229,7 +1288,6 @@ int main(void)
   i2c_manager_set_bus_recovery(I2C1, recover_i2c1_bus_runtime);
   spi_manager_assign_bus(SPI1, spi_mutexHandle, spi_semaphoreHandle);
   spi_manager_assign_bus(SPI3, spi3_mutexHandle, spi3_semaphoreHandle);
-  spi_manager_assign_bus(SPI2, spi2_mutexHandle, spi2_semaphoreHandle);
   /* USER CODE END RTOS_SEMAPHORES */
 
   /* USER CODE BEGIN RTOS_TIMERS */
@@ -1254,36 +1312,57 @@ int main(void)
   i2cdmataskHandle = osThreadNew(starti2cdmatask, NULL, &i2cdmatask_attributes);
 
   /* creation of rc522task */
+#if !REDUCED_I2C_CAN_TEST
   rc522taskHandle = osThreadNew(startrc522task, NULL, &rc522task_attributes);
+#endif
 
   /* creation of mpu6050task */
   mpu6050taskHandle = osThreadNew(startmpu6050task, NULL, &mpu6050task_attributes);
 
   /* creation of spidmatask */
+#if !REDUCED_I2C_CAN_TEST
   spidmataskHandle = osThreadNew(startspidmatask, NULL, &spidmatask_attributes);
+#endif
 
   /* creation of nrf24l01TXtask */
+#if !REDUCED_I2C_CAN_TEST
   nrf24l01TXtaskHandle = osThreadNew(startnrf24l01TXtask, NULL, &nrf24l01TXtask_attributes);
+#endif
 
   /* creation of nrf24l01RXtask */
+#if !REDUCED_I2C_CAN_TEST
   nrf24l01RXtaskHandle = osThreadNew(startnrf24l01RXtask, NULL, &nrf24l01RXtask_attributes);
+#endif
 
   /* creation of ili9341task */
+#if !REDUCED_I2C_CAN_TEST
   ili9341taskHandle = osThreadNew(startili9341task, NULL, &ili9341task_attributes);
+#endif
 
   /* creation of healthtask */
   healthtaskHandle = osThreadNew(starthealthtask, NULL, &healthtask_attributes);
 
+  /* creation of CAN2ReadTask */
+  CAN2ReadTaskHandle = osThreadNew(StartCAN2ReadTask, NULL, &CAN2ReadTask_attributes);
+
+  /* creation of CAN2WriteTask */
+  CAN2WriteTaskHandle = osThreadNew(StartCAN2WriteTask, NULL, &CAN2WriteTask_attributes);
+
   /* USER CODE BEGIN RTOS_THREADS */
   system_health_register_task(HEALTH_TASK_BME280, bme280taskHandle);
-  system_health_register_task(HEALTH_TASK_MPU6050, mpu6050taskHandle);
   system_health_register_task(HEALTH_TASK_I2C_DISPATCH, i2cdmataskHandle);
+#if !REDUCED_I2C_CAN_TEST
   system_health_register_task(HEALTH_TASK_RC522, rc522taskHandle);
+#endif
+  system_health_register_task(HEALTH_TASK_MPU6050, mpu6050taskHandle);
+#if !REDUCED_I2C_CAN_TEST
   system_health_register_task(HEALTH_TASK_SPI_DISPATCH, spidmataskHandle);
   system_health_register_task(HEALTH_TASK_NRF_TX, nrf24l01TXtaskHandle);
   system_health_register_task(HEALTH_TASK_NRF_RX, nrf24l01RXtaskHandle);
   system_health_register_task(HEALTH_TASK_DISPLAY, ili9341taskHandle);
-  system_health_register_task(HEALTH_TASK_MONITOR, healthtaskHandle);
+#endif
+  system_health_register_task(HEALTH_TASK_CAN_RX, CAN2ReadTaskHandle);
+  system_health_register_task(HEALTH_TASK_CAN_TX, CAN2WriteTaskHandle);
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -1353,6 +1432,43 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief CAN2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_CAN2_Init(void)
+{
+
+  /* USER CODE BEGIN CAN2_Init 0 */
+
+  /* USER CODE END CAN2_Init 0 */
+
+  /* USER CODE BEGIN CAN2_Init 1 */
+
+  /* USER CODE END CAN2_Init 1 */
+  hcan2.Instance = CAN2;
+  hcan2.Init.Prescaler = 8;
+  hcan2.Init.Mode = CAN_MODE_NORMAL;
+  hcan2.Init.SyncJumpWidth = CAN_SJW_1TQ;
+  hcan2.Init.TimeSeg1 = CAN_BS1_7TQ;
+  hcan2.Init.TimeSeg2 = CAN_BS2_2TQ;
+  hcan2.Init.TimeTriggeredMode = DISABLE;
+  hcan2.Init.AutoBusOff = ENABLE;
+  hcan2.Init.AutoWakeUp = DISABLE;
+  hcan2.Init.AutoRetransmission = ENABLE;
+  hcan2.Init.ReceiveFifoLocked = DISABLE;
+  hcan2.Init.TransmitFifoPriority = DISABLE;
+  if (HAL_CAN_Init(&hcan2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN CAN2_Init 2 */
+
+  /* USER CODE END CAN2_Init 2 */
+
 }
 
 /**
@@ -1537,105 +1653,6 @@ static void MX_SPI1_Init(void)
 }
 
 /**
-  * @brief SPI2 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_SPI2_Init(void)
-{
-
-  /* USER CODE BEGIN SPI2_Init 0 */
-
-  /* USER CODE END SPI2_Init 0 */
-
-  LL_SPI_InitTypeDef SPI_InitStruct = {0};
-
-  LL_GPIO_InitTypeDef GPIO_InitStruct = {0};
-
-  /* Peripheral clock enable */
-  LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_SPI2);
-
-  LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_GPIOB);
-  /**SPI2 GPIO Configuration
-  PB13   ------> SPI2_SCK
-  PB14   ------> SPI2_MISO
-  PB15   ------> SPI2_MOSI
-  */
-  GPIO_InitStruct.Pin = LL_GPIO_PIN_13|LL_GPIO_PIN_14|LL_GPIO_PIN_15;
-  GPIO_InitStruct.Mode = LL_GPIO_MODE_ALTERNATE;
-  GPIO_InitStruct.Speed = LL_GPIO_SPEED_FREQ_VERY_HIGH;
-  GPIO_InitStruct.OutputType = LL_GPIO_OUTPUT_PUSHPULL;
-  GPIO_InitStruct.Pull = LL_GPIO_PULL_NO;
-  GPIO_InitStruct.Alternate = LL_GPIO_AF_5;
-  LL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-  /* SPI2 DMA Init */
-
-  /* SPI2_TX Init */
-  LL_DMA_SetChannelSelection(DMA1, LL_DMA_STREAM_4, LL_DMA_CHANNEL_0);
-
-  LL_DMA_SetDataTransferDirection(DMA1, LL_DMA_STREAM_4, LL_DMA_DIRECTION_MEMORY_TO_PERIPH);
-
-  LL_DMA_SetStreamPriorityLevel(DMA1, LL_DMA_STREAM_4, LL_DMA_PRIORITY_LOW);
-
-  LL_DMA_SetMode(DMA1, LL_DMA_STREAM_4, LL_DMA_MODE_NORMAL);
-
-  LL_DMA_SetPeriphIncMode(DMA1, LL_DMA_STREAM_4, LL_DMA_PERIPH_NOINCREMENT);
-
-  LL_DMA_SetMemoryIncMode(DMA1, LL_DMA_STREAM_4, LL_DMA_MEMORY_INCREMENT);
-
-  LL_DMA_SetPeriphSize(DMA1, LL_DMA_STREAM_4, LL_DMA_PDATAALIGN_BYTE);
-
-  LL_DMA_SetMemorySize(DMA1, LL_DMA_STREAM_4, LL_DMA_MDATAALIGN_BYTE);
-
-  LL_DMA_DisableFifoMode(DMA1, LL_DMA_STREAM_4);
-
-  /* SPI2_RX Init */
-  LL_DMA_SetChannelSelection(DMA1, LL_DMA_STREAM_3, LL_DMA_CHANNEL_0);
-
-  LL_DMA_SetDataTransferDirection(DMA1, LL_DMA_STREAM_3, LL_DMA_DIRECTION_PERIPH_TO_MEMORY);
-
-  LL_DMA_SetStreamPriorityLevel(DMA1, LL_DMA_STREAM_3, LL_DMA_PRIORITY_LOW);
-
-  LL_DMA_SetMode(DMA1, LL_DMA_STREAM_3, LL_DMA_MODE_NORMAL);
-
-  LL_DMA_SetPeriphIncMode(DMA1, LL_DMA_STREAM_3, LL_DMA_PERIPH_NOINCREMENT);
-
-  LL_DMA_SetMemoryIncMode(DMA1, LL_DMA_STREAM_3, LL_DMA_MEMORY_INCREMENT);
-
-  LL_DMA_SetPeriphSize(DMA1, LL_DMA_STREAM_3, LL_DMA_PDATAALIGN_BYTE);
-
-  LL_DMA_SetMemorySize(DMA1, LL_DMA_STREAM_3, LL_DMA_MDATAALIGN_BYTE);
-
-  LL_DMA_DisableFifoMode(DMA1, LL_DMA_STREAM_3);
-
-  /* SPI2 interrupt Init */
-  NVIC_SetPriority(SPI2_IRQn, NVIC_EncodePriority(NVIC_GetPriorityGrouping(),5, 0));
-  NVIC_EnableIRQ(SPI2_IRQn);
-
-  /* USER CODE BEGIN SPI2_Init 1 */
-
-  /* USER CODE END SPI2_Init 1 */
-  /* SPI2 parameter configuration*/
-  SPI_InitStruct.TransferDirection = LL_SPI_FULL_DUPLEX;
-  SPI_InitStruct.Mode = LL_SPI_MODE_MASTER;
-  SPI_InitStruct.DataWidth = LL_SPI_DATAWIDTH_8BIT;
-  SPI_InitStruct.ClockPolarity = LL_SPI_POLARITY_LOW;
-  SPI_InitStruct.ClockPhase = LL_SPI_PHASE_1EDGE;
-  SPI_InitStruct.NSS = LL_SPI_NSS_SOFT;
-  SPI_InitStruct.BaudRate = LL_SPI_BAUDRATEPRESCALER_DIV4;
-  SPI_InitStruct.BitOrder = LL_SPI_MSB_FIRST;
-  SPI_InitStruct.CRCCalculation = LL_SPI_CRCCALCULATION_DISABLE;
-  SPI_InitStruct.CRCPoly = 10;
-  LL_SPI_Init(SPI2, &SPI_InitStruct);
-  LL_SPI_SetStandard(SPI2, LL_SPI_PROTOCOL_MOTOROLA);
-  /* USER CODE BEGIN SPI2_Init 2 */
-
-  /* USER CODE END SPI2_Init 2 */
-
-}
-
-/**
   * @brief SPI3 Initialization Function
   * @param None
   * @retval None
@@ -1752,12 +1769,6 @@ static void MX_DMA_Init(void)
   /* DMA1_Stream2_IRQn interrupt configuration */
   NVIC_SetPriority(DMA1_Stream2_IRQn, NVIC_EncodePriority(NVIC_GetPriorityGrouping(),5, 0));
   NVIC_EnableIRQ(DMA1_Stream2_IRQn);
-  /* DMA1_Stream3_IRQn interrupt configuration */
-  NVIC_SetPriority(DMA1_Stream3_IRQn, NVIC_EncodePriority(NVIC_GetPriorityGrouping(),5, 0));
-  NVIC_EnableIRQ(DMA1_Stream3_IRQn);
-  /* DMA1_Stream4_IRQn interrupt configuration */
-  NVIC_SetPriority(DMA1_Stream4_IRQn, NVIC_EncodePriority(NVIC_GetPriorityGrouping(),5, 0));
-  NVIC_EnableIRQ(DMA1_Stream4_IRQn);
   /* DMA1_Stream5_IRQn interrupt configuration */
   NVIC_SetPriority(DMA1_Stream5_IRQn, NVIC_EncodePriority(NVIC_GetPriorityGrouping(),5, 0));
   NVIC_EnableIRQ(DMA1_Stream5_IRQn);
@@ -1784,20 +1795,11 @@ static void MX_GPIO_Init(void)
   /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
-  LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_GPIOE);
   LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_GPIOB);
+  LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_GPIOE);
   LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_GPIOC);
   LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_GPIOA);
   LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_GPIOD);
-
-  /**/
-  LL_GPIO_SetOutputPin(GPIOE, TFT1_CS_Pin|TFT1_RST_Pin|TFT2_CS_Pin|TFT2_RST_Pin);
-
-  /**/
-  LL_GPIO_SetOutputPin(nrf24_csn_pin_spi3_GPIO_Port, nrf24_csn_pin_spi3_Pin);
-
-  /**/
-  LL_GPIO_SetOutputPin(GPIOD, nrf24_csn_pin_spi1_Pin|rc522_cs_pin_Pin|rc522_rst_pin_Pin);
 
   /**/
   LL_GPIO_ResetOutputPin(GPIOE, TFT1_DC_Pin|TFT2_DC_Pin);
@@ -1809,8 +1811,81 @@ static void MX_GPIO_Init(void)
   LL_GPIO_ResetOutputPin(nrf24_ce_pin_spi1_GPIO_Port, nrf24_ce_pin_spi1_Pin);
 
   /**/
-  GPIO_InitStruct.Pin = TFT1_CS_Pin|TFT1_DC_Pin|TFT1_RST_Pin|TFT2_CS_Pin
-                          |TFT2_DC_Pin|TFT2_RST_Pin;
+  LL_GPIO_SetOutputPin(GPIOE, TFT1_RST_Pin|TFT1_CS_Pin|TFT2_RST_Pin|TFT2_CS_Pin);
+
+  /**/
+  LL_GPIO_SetOutputPin(nrf24_csn_pin_spi3_GPIO_Port, nrf24_csn_pin_spi3_Pin);
+
+  /**/
+  LL_GPIO_SetOutputPin(GPIOD, nrf24_csn_pin_spi1_Pin|rc522_cs_pin_Pin|rc522_rst_pin_Pin);
+
+  /**/
+  LL_SYSCFG_SetEXTISource(LL_SYSCFG_EXTI_PORTB, LL_SYSCFG_EXTI_LINE1);
+
+  /**/
+  LL_SYSCFG_SetEXTISource(LL_SYSCFG_EXTI_PORTC, LL_SYSCFG_EXTI_LINE6);
+
+  /**/
+  LL_SYSCFG_SetEXTISource(LL_SYSCFG_EXTI_PORTD, LL_SYSCFG_EXTI_LINE2);
+
+  /**/
+  LL_SYSCFG_SetEXTISource(LL_SYSCFG_EXTI_PORTD, LL_SYSCFG_EXTI_LINE3);
+
+  /**/
+  EXTI_InitStruct.Line_0_31 = LL_EXTI_LINE_1;
+  EXTI_InitStruct.LineCommand = ENABLE;
+  EXTI_InitStruct.Mode = LL_EXTI_MODE_IT;
+  EXTI_InitStruct.Trigger = LL_EXTI_TRIGGER_RISING;
+  LL_EXTI_Init(&EXTI_InitStruct);
+
+  /**/
+  EXTI_InitStruct.Line_0_31 = LL_EXTI_LINE_6;
+  EXTI_InitStruct.LineCommand = ENABLE;
+  EXTI_InitStruct.Mode = LL_EXTI_MODE_IT;
+  EXTI_InitStruct.Trigger = LL_EXTI_TRIGGER_FALLING;
+  LL_EXTI_Init(&EXTI_InitStruct);
+
+  /**/
+  EXTI_InitStruct.Line_0_31 = LL_EXTI_LINE_2;
+  EXTI_InitStruct.LineCommand = ENABLE;
+  EXTI_InitStruct.Mode = LL_EXTI_MODE_IT;
+  EXTI_InitStruct.Trigger = LL_EXTI_TRIGGER_FALLING;
+  LL_EXTI_Init(&EXTI_InitStruct);
+
+  /**/
+  EXTI_InitStruct.Line_0_31 = LL_EXTI_LINE_3;
+  EXTI_InitStruct.LineCommand = ENABLE;
+  EXTI_InitStruct.Mode = LL_EXTI_MODE_IT;
+  EXTI_InitStruct.Trigger = LL_EXTI_TRIGGER_FALLING;
+  LL_EXTI_Init(&EXTI_InitStruct);
+
+  /**/
+  LL_GPIO_SetPinPull(mpu6050_irq_pin_GPIO_Port, mpu6050_irq_pin_Pin, LL_GPIO_PULL_DOWN);
+
+  /**/
+  LL_GPIO_SetPinPull(nrf24_irq_pin_spi3_GPIO_Port, nrf24_irq_pin_spi3_Pin, LL_GPIO_PULL_UP);
+
+  /**/
+  LL_GPIO_SetPinPull(nrf24_irq_pin_spi1_GPIO_Port, nrf24_irq_pin_spi1_Pin, LL_GPIO_PULL_UP);
+
+  /**/
+  LL_GPIO_SetPinPull(rc522_irq_pin_GPIO_Port, rc522_irq_pin_Pin, LL_GPIO_PULL_UP);
+
+  /**/
+  LL_GPIO_SetPinMode(mpu6050_irq_pin_GPIO_Port, mpu6050_irq_pin_Pin, LL_GPIO_MODE_INPUT);
+
+  /**/
+  LL_GPIO_SetPinMode(nrf24_irq_pin_spi3_GPIO_Port, nrf24_irq_pin_spi3_Pin, LL_GPIO_MODE_INPUT);
+
+  /**/
+  LL_GPIO_SetPinMode(nrf24_irq_pin_spi1_GPIO_Port, nrf24_irq_pin_spi1_Pin, LL_GPIO_MODE_INPUT);
+
+  /**/
+  LL_GPIO_SetPinMode(rc522_irq_pin_GPIO_Port, rc522_irq_pin_Pin, LL_GPIO_MODE_INPUT);
+
+  /**/
+  GPIO_InitStruct.Pin = TFT1_DC_Pin|TFT1_RST_Pin|TFT1_CS_Pin|TFT2_DC_Pin
+                          |TFT2_RST_Pin|TFT2_CS_Pin;
   GPIO_InitStruct.Mode = LL_GPIO_MODE_OUTPUT;
   GPIO_InitStruct.Speed = LL_GPIO_SPEED_FREQ_HIGH;
   GPIO_InitStruct.OutputType = LL_GPIO_OUTPUT_PUSHPULL;
@@ -1849,70 +1924,6 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = LL_GPIO_PULL_NO;
   LL_GPIO_Init(nrf24_csn_pin_spi1_GPIO_Port, &GPIO_InitStruct);
 
-  /**/
-  LL_SYSCFG_SetEXTISource(LL_SYSCFG_EXTI_PORTC, LL_SYSCFG_EXTI_LINE6);
-
-  /**/
-  LL_SYSCFG_SetEXTISource(LL_SYSCFG_EXTI_PORTD, LL_SYSCFG_EXTI_LINE2);
-
-  /**/
-  LL_SYSCFG_SetEXTISource(LL_SYSCFG_EXTI_PORTD, LL_SYSCFG_EXTI_LINE3);
-
-  /**/
-  LL_SYSCFG_SetEXTISource(LL_SYSCFG_EXTI_PORTB, LL_SYSCFG_EXTI_LINE1);
-
-  /**/
-  EXTI_InitStruct.Line_0_31 = LL_EXTI_LINE_6;
-  EXTI_InitStruct.LineCommand = ENABLE;
-  EXTI_InitStruct.Mode = LL_EXTI_MODE_IT;
-  EXTI_InitStruct.Trigger = LL_EXTI_TRIGGER_FALLING;
-  LL_EXTI_Init(&EXTI_InitStruct);
-
-  /**/
-  EXTI_InitStruct.Line_0_31 = LL_EXTI_LINE_2;
-  EXTI_InitStruct.LineCommand = ENABLE;
-  EXTI_InitStruct.Mode = LL_EXTI_MODE_IT;
-  EXTI_InitStruct.Trigger = LL_EXTI_TRIGGER_FALLING;
-  LL_EXTI_Init(&EXTI_InitStruct);
-
-  /**/
-  EXTI_InitStruct.Line_0_31 = LL_EXTI_LINE_3;
-  EXTI_InitStruct.LineCommand = ENABLE;
-  EXTI_InitStruct.Mode = LL_EXTI_MODE_IT;
-  EXTI_InitStruct.Trigger = LL_EXTI_TRIGGER_FALLING;
-  LL_EXTI_Init(&EXTI_InitStruct);
-
-  /**/
-  EXTI_InitStruct.Line_0_31 = LL_EXTI_LINE_1;
-  EXTI_InitStruct.LineCommand = ENABLE;
-  EXTI_InitStruct.Mode = LL_EXTI_MODE_IT;
-  EXTI_InitStruct.Trigger = LL_EXTI_TRIGGER_RISING;
-  LL_EXTI_Init(&EXTI_InitStruct);
-
-  /**/
-  LL_GPIO_SetPinPull(nrf24_irq_pin_spi3_GPIO_Port, nrf24_irq_pin_spi3_Pin, LL_GPIO_PULL_UP);
-
-  /**/
-  LL_GPIO_SetPinPull(nrf24_irq_pin_spi1_GPIO_Port, nrf24_irq_pin_spi1_Pin, LL_GPIO_PULL_UP);
-
-  /**/
-  LL_GPIO_SetPinPull(rc522_irq_pin_GPIO_Port, rc522_irq_pin_Pin, LL_GPIO_PULL_UP);
-
-  /**/
-  LL_GPIO_SetPinPull(mpu6050_irq_pin_GPIO_Port, mpu6050_irq_pin_Pin, LL_GPIO_PULL_DOWN);
-
-  /**/
-  LL_GPIO_SetPinMode(nrf24_irq_pin_spi3_GPIO_Port, nrf24_irq_pin_spi3_Pin, LL_GPIO_MODE_INPUT);
-
-  /**/
-  LL_GPIO_SetPinMode(nrf24_irq_pin_spi1_GPIO_Port, nrf24_irq_pin_spi1_Pin, LL_GPIO_MODE_INPUT);
-
-  /**/
-  LL_GPIO_SetPinMode(rc522_irq_pin_GPIO_Port, rc522_irq_pin_Pin, LL_GPIO_MODE_INPUT);
-
-  /**/
-  LL_GPIO_SetPinMode(mpu6050_irq_pin_GPIO_Port, mpu6050_irq_pin_Pin, LL_GPIO_MODE_INPUT);
-
   /* EXTI interrupt init*/
   NVIC_SetPriority(EXTI1_IRQn, NVIC_EncodePriority(NVIC_GetPriorityGrouping(),5, 0));
   NVIC_EnableIRQ(EXTI1_IRQn);
@@ -1925,7 +1936,7 @@ static void MX_GPIO_Init(void)
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
-  // Ekranlar SPI2'yi ortak kullanıyor. İkisini de başlangıçta seçimsiz bırak.
+  // Ekranlar SPI3'u ayri CS pinleriyle ortak kullanıyor. İkisini de başlangıçta seçimsiz bırak.
   LL_GPIO_SetOutputPin(GPIOE, TFT1_CS_Pin|TFT1_RST_Pin|TFT2_CS_Pin|TFT2_RST_Pin);
   LL_GPIO_ResetOutputPin(GPIOE, TFT1_DC_Pin|TFT2_DC_Pin);
 
@@ -2222,6 +2233,7 @@ void startrc522task(void *argument)
 		}
 	}
 	rc522_init_completed = true;
+	(void)spi_manager_register_validator(SPI1, validate_rc522_spi, my_rc522);
 	rc522_last_liveness_tick = osKernelGetTickCount();
 	osStatus_t initial_display_mutex;
 	initial_display_mutex = osMutexAcquire(sensor_data_mutexHandle, 10);
@@ -2633,11 +2645,9 @@ void startspidmatask(void *argument)
   };
 
   spi_manager_set_dispatch_notification(SPI1, spidmataskHandle, SPI1_DMA_DONE_FLAG);
-  spi_manager_set_dispatch_notification(SPI2, spidmataskHandle, SPI2_DMA_DONE_FLAG);
   spi_manager_set_dispatch_notification(SPI3, spidmataskHandle, SPI3_DMA_DONE_FLAG);
 
   while(osSemaphoreAcquire(spi_semaphoreHandle, 0) == osOK) { }
-  while(osSemaphoreAcquire(spi2_semaphoreHandle, 0) == osOK) { }
   while(osSemaphoreAcquire(spi3_semaphoreHandle, 0) == osOK) { }
   osThreadFlagsClear(SPI_DMA_ALL_FLAGS);
   spi_dispatch_ready = true;
@@ -2779,6 +2789,8 @@ void startnrf24l01TXtask(void *argument)
   if(my_nrf_tx == NULL) {
     for(;;) { osDelay(1000); }
   }
+
+  (void)spi_manager_register_validator(SPI3, validate_nrf24_spi, my_nrf_tx);
 
   nrf24l01_assign_interrupt_task(my_nrf_tx, nrf24l01TXtaskHandle, 0x01);
   nrf_tx_init_completed = true;
@@ -2934,6 +2946,8 @@ void startnrf24l01RXtask(void *argument)
     for(;;) { osDelay(1000); }
   }
 
+  (void)spi_manager_register_validator(SPI1, validate_nrf24_spi, my_nrf_rx);
+
   nrf24l01_assign_interrupt_task(my_nrf_rx, nrf24l01RXtaskHandle, 0x01);
   osThreadFlagsClear(0x07);
   nrf24l01_clear_interrupts(my_nrf_rx);
@@ -3055,10 +3069,10 @@ void startili9341task(void *argument)
   }
 
   ili9341_user_configs tft1_cfg = {0};
-  tft1_cfg.spi_handle = SPI2;
+  tft1_cfg.spi_handle = SPI3;
   tft1_cfg.dma_handle = DMA1;
-  tft1_cfg.dma_tx_stream = LL_DMA_STREAM_4;
-  tft1_cfg.dma_rx_stream = LL_DMA_STREAM_3;
+  tft1_cfg.dma_tx_stream = LL_DMA_STREAM_5;
+  tft1_cfg.dma_rx_stream = LL_DMA_STREAM_2;
   tft1_cfg.cs_port = TFT1_CS_GPIO_Port;
   tft1_cfg.cs_pin = TFT1_CS_Pin;
   tft1_cfg.dc_port = TFT1_DC_GPIO_Port;
@@ -3068,10 +3082,10 @@ void startili9341task(void *argument)
   tft1_cfg.rotation = ILI9341_ROTATION_90;
 
   ili9341_user_configs tft2_cfg = {0};
-  tft2_cfg.spi_handle = SPI2;
+  tft2_cfg.spi_handle = SPI3;
   tft2_cfg.dma_handle = DMA1;
-  tft2_cfg.dma_tx_stream = LL_DMA_STREAM_4;
-  tft2_cfg.dma_rx_stream = LL_DMA_STREAM_3;
+  tft2_cfg.dma_tx_stream = LL_DMA_STREAM_5;
+  tft2_cfg.dma_rx_stream = LL_DMA_STREAM_2;
   tft2_cfg.cs_port = TFT2_CS_GPIO_Port;
   tft2_cfg.cs_pin = TFT2_CS_Pin;
   tft2_cfg.dc_port = TFT2_DC_GPIO_Port;
@@ -3213,6 +3227,54 @@ void startili9341task(void *argument)
   /* USER CODE END startili9341task */
 }
 
+static bool recover_supervised_bus(system_health_bus_id_t bus){
+  if(bus == SYSTEM_BUS_I2C1){
+    /* Aktif DMA/polling transferini health tasktan zorla bozma. Manager mutexi
+     * recovery ile dispatcher'i siraya sokar; mesgulse sonraki turda denenir. */
+    return i2c_manager_recover_bus(I2C1) == _i2c_manager_ok;
+  }
+  if(bus == SYSTEM_BUS_SPI1){
+    return spi_manager_recover_bus(SPI1) == _spi_manager_ok;
+  }
+  if(bus == SYSTEM_BUS_SPI2){
+    return spi_manager_recover_bus(SPI2) == _spi_manager_ok;
+  }
+  if(bus == SYSTEM_BUS_SPI3){
+    return spi_manager_recover_bus(SPI3) == _spi_manager_ok;
+  }
+  if(bus == SYSTEM_BUS_CAN2){
+    return can_manager_recover(CAN2) == can_manager_ok;
+  }
+  return false;
+}
+
+static void supervise_faulted_buses(uint32_t now){
+  for(uint32_t index = 0; index < SYSTEM_BUS_COUNT; index++){
+    volatile system_health_bus_diagnostics_t *health = &g_system_bus_health[index];
+    if(health->state == SYSTEM_BUS_STATE_OK) continue;
+
+    if((now - health->last_recovery_tick) >= BUS_RECOVERY_RETRY_PERIOD_MS){
+      system_health_bus_mark_recovering((system_health_bus_id_t)index);
+      bool recovered = recover_supervised_bus((system_health_bus_id_t)index);
+      int32_t recovery_status = -1;
+      if(recovered) recovery_status = 0;
+      system_health_bus_record_recovery((system_health_bus_id_t)index,
+              recovered, recovery_status);
+    }
+
+    if((health->fault_since_tick != 0) &&
+       ((now - health->fault_since_tick) >= BUS_RECOVERY_RESET_TIMEOUT_MS)){
+      health->reset_deadline_expired = true;
+      if(is_mcu_reset_allowed){
+        __DSB();
+        NVIC_SystemReset();
+      }else{
+        health->reset_suppressed = true;
+      }
+    }
+  }
+}
+
 /* USER CODE BEGIN Header_starthealthtask */
 /**
 * @brief Function implementing the healthtask thread.
@@ -3232,6 +3294,15 @@ void starthealthtask(void *argument)
   uint32_t startup_tick = osKernelGetTickCount();
   uint32_t next_check = osKernelGetTickCount();
   bool watchdog_ready = system_health_watchdog_start();
+  uint32_t observed_bme_tick = 0;
+  uint32_t observed_mpu_tick = 0;
+  uint32_t observed_rc522_tick = 0;
+  uint32_t observed_nrf_tx_tick = 0;
+  uint32_t observed_nrf_rx_tick = 0;
+  uint32_t observed_display_tick = 0;
+  uint32_t observed_can_tx_count = 0;
+  uint32_t observed_can_rx_count = 0;
+  uint32_t observed_can_error_count = 0;
 
   for(;;)
   {
@@ -3242,6 +3313,65 @@ void starthealthtask(void *argument)
     bool all_tasks_healthy = system_health_evaluate_window(
             ACTIVE_HEALTH_MASK);
 
+    if(bme280_last_success_tick != observed_bme_tick){
+      observed_bme_tick = bme280_last_success_tick;
+      system_health_bus_record_success(SYSTEM_BUS_I2C1,
+              SYSTEM_SOURCE_BME280, SYSTEM_OPERATION_READ, 0x76, 0);
+    }
+    if(mpu6050_last_success_tick != observed_mpu_tick){
+      observed_mpu_tick = mpu6050_last_success_tick;
+      system_health_bus_record_success(SYSTEM_BUS_I2C1,
+              SYSTEM_SOURCE_MPU6500, SYSTEM_OPERATION_READ, 0x68, 0);
+    }
+    if(!REDUCED_I2C_CAN_TEST &&
+       rc522_last_liveness_tick != observed_rc522_tick){
+      observed_rc522_tick = rc522_last_liveness_tick;
+      system_health_bus_record_success(SYSTEM_BUS_SPI1,
+              SYSTEM_SOURCE_RC522, SYSTEM_OPERATION_TRANSFER, 0, 0);
+    }
+    if(!REDUCED_I2C_CAN_TEST &&
+       nrf_tx_last_success_tick != observed_nrf_tx_tick){
+      observed_nrf_tx_tick = nrf_tx_last_success_tick;
+      system_health_bus_record_success(SYSTEM_BUS_SPI3,
+              SYSTEM_SOURCE_NRF24_TX, SYSTEM_OPERATION_WRITE, 0, 0);
+    }
+    if(!REDUCED_I2C_CAN_TEST &&
+       nrf_rx_last_success_tick != observed_nrf_rx_tick){
+      observed_nrf_rx_tick = nrf_rx_last_success_tick;
+      system_health_bus_record_success(SYSTEM_BUS_SPI1,
+              SYSTEM_SOURCE_NRF24_RX, SYSTEM_OPERATION_READ, 0, 0);
+    }
+    if(!REDUCED_I2C_CAN_TEST &&
+       ili9341_last_success_tick != observed_display_tick){
+      observed_display_tick = ili9341_last_success_tick;
+      system_health_bus_record_success(SYSTEM_BUS_SPI3,
+              SYSTEM_SOURCE_ILI9341, SYSTEM_OPERATION_WRITE, 0, 0);
+    }
+    if(g_can2_debug.tx_complete_count != observed_can_tx_count){
+      observed_can_tx_count = g_can2_debug.tx_complete_count;
+      system_health_bus_record_success(SYSTEM_BUS_CAN2,
+              SYSTEM_SOURCE_CAN_TX, SYSTEM_OPERATION_WRITE,
+              g_can2_last_tx_frame.id, g_can2_last_tx_frame.dlc);
+    }
+    if(g_can2_debug.rx_received_count != observed_can_rx_count){
+      observed_can_rx_count = g_can2_debug.rx_received_count;
+      uint32_t received_id = 0;
+      if(g_can2_last_rx_frame_ptr != NULL){
+        received_id = g_can2_last_rx_frame_ptr->id;
+      }
+      system_health_bus_record_success(SYSTEM_BUS_CAN2,
+              SYSTEM_SOURCE_CAN_RX, SYSTEM_OPERATION_READ, received_id, 0);
+    }
+    (void)can_manager_check_ack_timeout(CAN2, CAN_ACK_TIMEOUT_MS);
+    uint32_t can_error_count = g_can2_debug.tx_error_count +
+            g_can2_debug.error_irq_count + g_can2_debug.bus_off_count +
+            g_can2_debug.ack_timeout_count;
+    if(can_error_count != observed_can_error_count){
+      observed_can_error_count = can_error_count;
+      system_health_bus_record_failure(SYSTEM_BUS_CAN2,
+              (int32_t)g_can2_debug.last_status);
+    }
+
     uint32_t stale_mask = 0;
     if(bme280_init_completed &&
        (now - bme280_last_success_tick) >= SENSOR_DATA_STALE_TIMEOUT_MS){
@@ -3251,30 +3381,94 @@ void starthealthtask(void *argument)
        (now - mpu6050_last_success_tick) >= SENSOR_DATA_STALE_TIMEOUT_MS){
       stale_mask |= SENSOR_STALE_MPU6050_MASK;
     }
-    if(rc522_init_completed &&
+    if(!REDUCED_I2C_CAN_TEST && rc522_init_completed &&
        (now - rc522_last_liveness_tick) >=
                RC522_LIVENESS_STALE_TIMEOUT_MS){
       stale_mask |= SPI_STALE_RC522_MASK;
     }
-    if(nrf_tx_init_completed &&
+    if(!REDUCED_I2C_CAN_TEST && nrf_tx_init_completed &&
        (now - nrf_tx_last_success_tick) >= NRF_PROGRESS_STALE_TIMEOUT_MS){
       stale_mask |= SPI_STALE_NRF_TX_MASK;
     }
-    if(nrf_rx_init_completed &&
+    if(!REDUCED_I2C_CAN_TEST && nrf_rx_init_completed &&
        (now - nrf_rx_last_success_tick) >= NRF_PROGRESS_STALE_TIMEOUT_MS){
       stale_mask |= SPI_STALE_NRF_RX_MASK;
     }
-    if(ili9341_init_completed &&
+    if(!REDUCED_I2C_CAN_TEST && ili9341_init_completed &&
        (now - ili9341_last_success_tick) >=
                DISPLAY_PROGRESS_STALE_TIMEOUT_MS){
       stale_mask |= SPI_STALE_DISPLAY_MASK;
     }
     sensor_data_stale_mask = stale_mask;
     subsystem_stale_mask = stale_mask;
+
+    bool startup_grace_elapsed =
+            (now - startup_tick) >= WATCHDOG_STARTUP_GRACE_MS;
+    if(startup_grace_elapsed){
+      if((!bme280_init_completed || !mpu6050_init_completed) &&
+         (g_system_bus_health[SYSTEM_BUS_I2C1].state == SYSTEM_BUS_STATE_OK)){
+        system_health_bus_record_failure(SYSTEM_BUS_I2C1,
+                (int32_t)i2c_manager_last_result(I2C1));
+      }
+
+      if(!REDUCED_I2C_CAN_TEST &&
+         (!rc522_init_completed || !nrf_rx_init_completed) &&
+         (g_system_bus_health[SYSTEM_BUS_SPI1].state == SYSTEM_BUS_STATE_OK)){
+        system_health_bus_record_failure(SYSTEM_BUS_SPI1,
+                _spi_manager_uninited_struct);
+      }
+
+      if(!REDUCED_I2C_CAN_TEST && !ili9341_init_completed &&
+         (g_system_bus_health[SYSTEM_BUS_SPI3].state == SYSTEM_BUS_STATE_OK)){
+        system_health_bus_record_failure(SYSTEM_BUS_SPI3,
+                _spi_manager_uninited_struct);
+      }
+
+      if(!REDUCED_I2C_CAN_TEST && !nrf_tx_init_completed &&
+         (g_system_bus_health[SYSTEM_BUS_SPI3].state == SYSTEM_BUS_STATE_OK)){
+        system_health_bus_record_failure(SYSTEM_BUS_SPI3,
+                _spi_manager_uninited_struct);
+      }
+
+      if((g_can2_debug.initialized == 0) &&
+         (g_system_bus_health[SYSTEM_BUS_CAN2].state == SYSTEM_BUS_STATE_OK)){
+        system_health_bus_record_failure(SYSTEM_BUS_CAN2,
+                can_manager_not_initialized);
+      }
+    }
+
+    if((stale_mask & (SENSOR_STALE_BME280_MASK |
+            SENSOR_STALE_MPU6050_MASK)) != 0){
+      if(g_system_bus_health[SYSTEM_BUS_I2C1].state == SYSTEM_BUS_STATE_OK){
+        system_health_bus_record_failure(SYSTEM_BUS_I2C1,
+                (int32_t)i2c_manager_last_result(I2C1));
+      }
+    }
+    if((stale_mask & (SPI_STALE_RC522_MASK | SPI_STALE_NRF_RX_MASK)) != 0){
+      if(g_system_bus_health[SYSTEM_BUS_SPI1].state == SYSTEM_BUS_STATE_OK){
+        system_health_bus_record_failure(SYSTEM_BUS_SPI1, _spi_manager_timeout);
+      }
+    }
+    if((stale_mask & SPI_STALE_DISPLAY_MASK) != 0){
+      if(g_system_bus_health[SYSTEM_BUS_SPI3].state == SYSTEM_BUS_STATE_OK){
+        system_health_bus_record_failure(SYSTEM_BUS_SPI3, _spi_manager_timeout);
+      }
+    }
+    if((stale_mask & SPI_STALE_NRF_TX_MASK) != 0){
+      if(g_system_bus_health[SYSTEM_BUS_SPI3].state == SYSTEM_BUS_STATE_OK){
+        system_health_bus_record_failure(SYSTEM_BUS_SPI3, _spi_manager_timeout);
+      }
+    }
+
+    system_health_bus_refresh_ages(now);
+    supervise_faulted_buses(now);
     bool subsystems_initialized = bme280_init_completed &&
-            mpu6050_init_completed && rc522_init_completed &&
-            nrf_tx_init_completed && nrf_rx_init_completed &&
-            ili9341_init_completed;
+            mpu6050_init_completed && (g_can2_debug.initialized != 0);
+#if !REDUCED_I2C_CAN_TEST
+    subsystems_initialized = subsystems_initialized &&
+            rc522_init_completed && nrf_tx_init_completed &&
+            nrf_rx_init_completed && ili9341_init_completed;
+#endif
     if(!health_normal_monitoring_started && subsystems_initialized &&
        all_tasks_healthy && stale_mask == 0){
       health_normal_monitoring_started = true;
@@ -3282,9 +3476,48 @@ void starthealthtask(void *argument)
 
     health_startup_grace_active = !health_normal_monitoring_started &&
             (now - startup_tick) < WATCHDOG_STARTUP_GRACE_MS;
-    health_watchdog_feed_allowed = health_normal_monitoring_started ?
-            (all_tasks_healthy && stale_mask == 0) :
-            health_startup_grace_active;
+    bool bus_fault_active = false;
+    uint32_t tolerated_missing_heartbeat_mask = 0;
+    for(uint32_t index = 0; index < SYSTEM_BUS_COUNT; index++){
+      if(g_system_bus_health[index].state != SYSTEM_BUS_STATE_OK){
+        bus_fault_active = true;
+
+        if(index == SYSTEM_BUS_I2C1){
+          tolerated_missing_heartbeat_mask |=
+                  SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_BME280) |
+                  SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_MPU6050);
+        }
+        if(index == SYSTEM_BUS_SPI1){
+          tolerated_missing_heartbeat_mask |=
+                  SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_RC522) |
+                  SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_NRF_RX);
+        }
+        if(index == SYSTEM_BUS_SPI3){
+          tolerated_missing_heartbeat_mask |=
+                  SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_NRF_TX) |
+                  SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_DISPLAY);
+        }
+        if(index == SYSTEM_BUS_CAN2){
+          tolerated_missing_heartbeat_mask |=
+                  SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_CAN_RX) |
+                  SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_CAN_TX);
+        }
+      }
+    }
+
+    uint32_t unexpected_missing_heartbeat_mask =
+            g_system_health.missing_heartbeat_mask &
+            ~tolerated_missing_heartbeat_mask;
+    bool recovery_window_healthy = bus_fault_active &&
+            (unexpected_missing_heartbeat_mask == 0);
+
+    if(health_normal_monitoring_started){
+      health_watchdog_feed_allowed = all_tasks_healthy ||
+              recovery_window_healthy;
+    }else{
+      health_watchdog_feed_allowed = health_startup_grace_active ||
+              recovery_window_healthy;
+    }
 
     if(!watchdog_ready){
       watchdog_ready = system_health_watchdog_start();
@@ -3297,6 +3530,90 @@ void starthealthtask(void *argument)
      * watchdog. The IWDG then resets a system that can no longer self-recover. */
   }
   /* USER CODE END starthealthtask */
+}
+
+/* USER CODE BEGIN Header_StartCAN2ReadTask */
+/**
+* @brief Function implementing the CAN2ReadTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartCAN2ReadTask */
+void StartCAN2ReadTask(void *argument)
+{
+  /* USER CODE BEGIN StartCAN2ReadTask */
+  (void)argument;
+
+  can_manager_status_t init_status;
+
+  do
+  {
+    init_status = can_manager_init(CAN2, CAN2ReadTaskHandle, CAN2WriteTaskHandle);
+    if(init_status != can_manager_ok) osDelay(100);
+  }
+  while(init_status != can_manager_ok);
+
+  for(;;)
+  {
+    system_health_heartbeat(HEALTH_TASK_CAN_RX);
+    uint32_t flags = osThreadFlagsWait(CAN_MANAGER_RX_EVENT_ANY, osFlagsWaitAny, 500);
+
+    if((flags & osFlagsError) != 0) continue;
+
+    if((flags & CAN_MANAGER_RX_EVENT_ERROR) != 0) can_manager_refresh_debug(CAN2);
+
+    const can_frame_t* received_frame;
+    while((received_frame = can_manager_rx_peek(CAN2)) != NULL)
+    {
+      /* received_frame gercek ring-buffer hucresidir; burada ikinci bir frame kopyasi olusturulmaz. */
+        if(received_frame->id == 0x103)
+        {
+            /* received_frame->data burada işlenir. */
+        }
+      (void)can_manager_rx_release(CAN2);
+    }
+  }
+  /* USER CODE END StartCAN2ReadTask */
+}
+
+/* USER CODE BEGIN Header_StartCAN2WriteTask */
+/**
+* @brief Function implementing the CAN2WriteTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartCAN2WriteTask */
+void StartCAN2WriteTask(void *argument)
+{
+  /* USER CODE BEGIN StartCAN2WriteTask */
+  (void)argument;
+
+  can_frame_t test_frame = {
+    .id = 0x407U,
+    .dlc = 7U,
+    .extended_id = false,
+    .remote_frame = false,
+    .data = {'F', '4', '0', '7', 'C', 'A', 'N', 0U},
+    .timestamp = 0U
+  };
+
+  (void)osThreadFlagsWait(CAN_MANAGER_TX_EVENT_READY, osFlagsWaitAny, osWaitForever);
+  uint32_t next_transmit_tick = osKernelGetTickCount();
+
+  for(;;)
+  {
+    system_health_heartbeat(HEALTH_TASK_CAN_TX);
+    next_transmit_tick += 1000;
+    osDelayUntil(next_transmit_tick);
+
+    can_manager_status_t send_status = can_manager_send(CAN2, &test_frame);
+    if(send_status == can_manager_no_tx_mailbox)
+    {
+      (void)osThreadFlagsWait(CAN_MANAGER_TX_EVENT_ANY, osFlagsWaitAny, 100);
+      (void)can_manager_send(CAN2, &test_frame);
+    }
+  }
+  /* USER CODE END StartCAN2WriteTask */
 }
 
 /**

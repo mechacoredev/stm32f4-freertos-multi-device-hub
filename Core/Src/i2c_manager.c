@@ -867,6 +867,15 @@ i2c_manager_return_status i2c_manager_read_dma(DMA_TypeDef* dma,
     bus->result = _i2c_manager_busy;
     bus->state = I2C_DMA_START_SENT;
 
+    /* Her RX transferinde DMA'nin temel kurallarini yeniden kur. Bu ayarlardan
+     * ozellikle MEMORY_INCREMENT kapali kalirsa butun byte'lar data[0]'in
+     * ustune yazilir ve data[1..size-1] eski degerlerinde kalir. */
+    LL_DMA_SetDataTransferDirection(dma, stream, LL_DMA_DIRECTION_PERIPH_TO_MEMORY);
+    LL_DMA_SetMode(dma, stream, LL_DMA_MODE_NORMAL);
+    LL_DMA_SetPeriphIncMode(dma, stream, LL_DMA_PERIPH_NOINCREMENT);
+    LL_DMA_SetMemoryIncMode(dma, stream, LL_DMA_MEMORY_INCREMENT);
+    LL_DMA_SetPeriphSize(dma, stream, LL_DMA_PDATAALIGN_BYTE);
+    LL_DMA_SetMemorySize(dma, stream, LL_DMA_MDATAALIGN_BYTE);
     LL_DMA_ConfigAddresses(dma, stream, LL_I2C_DMA_GetRegAddr(i2c),
             (uint32_t)data, LL_DMA_DIRECTION_PERIPH_TO_MEMORY);
     LL_DMA_SetDataLength(dma, stream, size);
@@ -1032,6 +1041,34 @@ i2c_manager_return_status i2c_manager_unlock_bus(I2C_TypeDef* i2c){
     }
     release_bus(bus, i2c, result);
     return result;
+}
+
+i2c_manager_return_status i2c_manager_recover_bus(I2C_TypeDef* i2c){
+    i2c_bus_context_t* bus = get_bus(i2c);
+    if(bus == NULL || bus->mutex == NULL || bus->recovery == NULL){
+        return _i2c_manager_uninited_struct;
+    }
+
+    /* Dispatcher aktif bir transferi tamamlarken veya temizlerken peripheral'i
+     * yeniden init etme. Mutex alinabiliyorsa I2C manager ile recovery ayni
+     * donanima ayni anda dokunmuyor demektir. */
+    i2c_manager_return_status status = acquire_bus(bus, i2c, 0,
+            I2C_MANAGER_OPERATION_NONE, 0, 0);
+    if(status != _i2c_manager_ok) return status;
+
+    if(bus->state != I2C_DMA_IDLE){
+        release_bus(bus, i2c, _i2c_manager_busy);
+        return _i2c_manager_busy;
+    }
+
+    set_phase(i2c, I2C_MANAGER_PHASE_RECOVERY);
+    bool recovered = run_physical_bus_recovery(bus, i2c);
+    clear_hardware_errors(i2c);
+    restore_receive_defaults(i2c);
+
+    status = recovered ? _i2c_manager_ok : _i2c_manager_bus_error;
+    release_bus(bus, i2c, status);
+    return status;
 }
 
 void i2c_manager_abort_transfer(I2C_TypeDef* i2c){

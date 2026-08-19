@@ -69,6 +69,9 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
+#define mpu6050_irq_pin_Pin LL_GPIO_PIN_1
+#define mpu6050_irq_pin_GPIO_Port GPIOB
+#define mpu6050_irq_pin_EXTI_IRQn EXTI1_IRQn
 #define TFT1_DC_Pin LL_GPIO_PIN_10
 #define TFT1_DC_GPIO_Port GPIOE
 #define TFT1_RST_Pin LL_GPIO_PIN_11
@@ -102,9 +105,6 @@ void Error_Handler(void);
 #define rc522_cs_pin_GPIO_Port GPIOD
 #define rc522_rst_pin_Pin LL_GPIO_PIN_7
 #define rc522_rst_pin_GPIO_Port GPIOD
-#define mpu6050_irq_pin_Pin LL_GPIO_PIN_1
-#define mpu6050_irq_pin_GPIO_Port GPIOB
-#define mpu6050_irq_pin_EXTI_IRQn EXTI1_IRQn
 
 /* USER CODE BEGIN Private defines */
 

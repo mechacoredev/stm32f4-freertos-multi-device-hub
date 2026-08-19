@@ -142,6 +142,7 @@ bool i2c_manager_is_dma_busy(I2C_TypeDef* i2c_handle);
 bool i2c_manager_last_transfer_succeeded(I2C_TypeDef* i2c_handle);
 i2c_manager_return_status i2c_manager_last_result(I2C_TypeDef* i2c_handle);
 i2c_manager_return_status i2c_manager_unlock_bus(I2C_TypeDef* i2c_handle);
+i2c_manager_return_status i2c_manager_recover_bus(I2C_TypeDef* i2c_handle);
 void i2c_manager_abort_transfer(I2C_TypeDef* i2c_handle);
 void i2c_manager_dma_handler(DMA_TypeDef* dma_handle, uint32_t dma_stream);
 void i2c_manager_event_handler(I2C_TypeDef* i2c_handle);

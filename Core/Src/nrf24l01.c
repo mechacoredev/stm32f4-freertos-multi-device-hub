@@ -203,6 +203,20 @@ nrf24l01_handle_t nrf24l01_init(nrf24l01_user_configs* config){
 	return dev;
 }
 
+bool nrf24l01_validate(nrf24l01_handle_t dev){
+	if(dev == NULL) return false;
+
+	uint8_t tx[2] = {REG_SETUP_AW, 0xFF};
+	uint8_t rx[2] = {0};
+	spi_manager_return_status status;
+
+	status = spi_manager_transfer_poll(dev->spi_handle, dev->csn_port,
+			dev->csn_pin, tx, rx, 2);
+	if(status != _spi_manager_ok) return false;
+
+	return (rx[1] >= 1) && (rx[1] <= 3);
+}
+
 void nrf24l01_start_listening(nrf24l01_handle_t dev){
     set_bit_mask(dev, REG_CONFIG, 0x03); // PRIM_RX=1
     LL_GPIO_SetOutputPin(dev->ce_port, dev->ce_pin); // Anteni aç
