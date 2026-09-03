@@ -24,7 +24,7 @@
 /* USER CODE BEGIN Includes */
 #include "i2c_manager.h"
 #include "spi_manager.h"
-#include "mpu6050.h"
+#include "mpu6500.h"
 #include "nrf24l01.h"
 #include "rc522.h"
 #include "can_manager.h"
@@ -62,9 +62,8 @@ extern void i2c_manager_error_handler(I2C_TypeDef* i2c_handle);
 extern void spi_manager_dma_handler(DMA_TypeDef* dma_handle, uint32_t dma_stream);
 extern void spi_manager_error_handler(SPI_TypeDef* spi_handle);
 extern nrf24l01_handle_t my_nrf_rx;
-extern nrf24l01_handle_t my_nrf_tx;
 extern rc522_handle_t my_rc522;
-extern mpu6050_handle_t my_mpu6050;
+extern mpu6500_handle_t my_mpu6500;
 /* USER CODE END 0 */
 
 /* External variables --------------------------------------------------------*/
@@ -174,26 +173,6 @@ void DebugMon_Handler(void)
 /******************************************************************************/
 
 /**
-  * @brief This function handles EXTI line1 interrupt.
-  */
-void EXTI1_IRQHandler(void)
-{
-  /* USER CODE BEGIN EXTI1_IRQn 0 */
-
-  /* USER CODE END EXTI1_IRQn 0 */
-  if (LL_EXTI_IsActiveFlag_0_31(LL_EXTI_LINE_1) != RESET)
-  {
-    LL_EXTI_ClearFlag_0_31(LL_EXTI_LINE_1);
-    /* USER CODE BEGIN LL_EXTI_LINE_1 */
-    if (my_mpu6050 != NULL) mpu6050_irq_handler();
-    /* USER CODE END LL_EXTI_LINE_1 */
-  }
-  /* USER CODE BEGIN EXTI1_IRQn 1 */
-
-  /* USER CODE END EXTI1_IRQn 1 */
-}
-
-/**
   * @brief This function handles EXTI line2 interrupt.
   */
 void EXTI2_IRQHandler(void)
@@ -234,6 +213,26 @@ void EXTI3_IRQHandler(void)
 }
 
 /**
+  * @brief This function handles EXTI lines 5 to 9 interrupts.
+  */
+void EXTI9_5_IRQHandler(void)
+{
+  /* USER CODE BEGIN EXTI9_5_IRQn 0 */
+
+  /* USER CODE END EXTI9_5_IRQn 0 */
+  if (LL_EXTI_IsActiveFlag_0_31(LL_EXTI_LINE_7) != RESET)
+  {
+    LL_EXTI_ClearFlag_0_31(LL_EXTI_LINE_7);
+    /* USER CODE BEGIN LL_EXTI_LINE_7 */
+    if (my_mpu6500 != NULL) mpu6500_irq_handler();
+    /* USER CODE END LL_EXTI_LINE_7 */
+  }
+  /* USER CODE BEGIN EXTI9_5_IRQn 1 */
+
+  /* USER CODE END EXTI9_5_IRQn 1 */
+}
+
+/**
   * @brief This function handles DMA1 stream0 global interrupt.
   */
 void DMA1_Stream0_IRQHandler(void)
@@ -260,6 +259,15 @@ void DMA1_Stream2_IRQHandler(void)
   /* USER CODE END DMA1_Stream2_IRQn 1 */
 }
 
+void DMA1_Stream3_IRQHandler(void)
+{
+  /* USER CODE BEGIN DMA1_Stream3_IRQn 0 */
+  i2c_manager_dma_handler(DMA1, LL_DMA_STREAM_3);
+  /* USER CODE END DMA1_Stream3_IRQn 0 */
+  /* USER CODE BEGIN DMA1_Stream3_IRQn 1 */
+  /* USER CODE END DMA1_Stream3_IRQn 1 */
+}
+
 /**
   * @brief This function handles DMA1 stream5 global interrupt.
   */
@@ -274,24 +282,13 @@ void DMA1_Stream5_IRQHandler(void)
   /* USER CODE END DMA1_Stream5_IRQn 1 */
 }
 
-/**
-  * @brief This function handles EXTI line[9:5] interrupts.
-  */
-void EXTI9_5_IRQHandler(void)
+void DMA1_Stream7_IRQHandler(void)
 {
-  /* USER CODE BEGIN EXTI9_5_IRQn 0 */
-
-  /* USER CODE END EXTI9_5_IRQn 0 */
-  if (LL_EXTI_IsActiveFlag_0_31(LL_EXTI_LINE_6) != RESET)
-  {
-    LL_EXTI_ClearFlag_0_31(LL_EXTI_LINE_6);
-    /* USER CODE BEGIN LL_EXTI_LINE_6 */
-    if (my_nrf_tx != NULL) nrf24l01_irq_handler(my_nrf_tx);
-    /* USER CODE END LL_EXTI_LINE_6 */
-  }
-  /* USER CODE BEGIN EXTI9_5_IRQn 1 */
-
-  /* USER CODE END EXTI9_5_IRQn 1 */
+  /* USER CODE BEGIN DMA1_Stream7_IRQn 0 */
+  i2c_manager_dma_handler(DMA1, LL_DMA_STREAM_7);
+  /* USER CODE END DMA1_Stream7_IRQn 0 */
+  /* USER CODE BEGIN DMA1_Stream7_IRQn 1 */
+  /* USER CODE END DMA1_Stream7_IRQn 1 */
 }
 
 /**
@@ -318,6 +315,24 @@ void I2C1_ER_IRQHandler(void)
   /* USER CODE BEGIN I2C1_ER_IRQn 1 */
 
   /* USER CODE END I2C1_ER_IRQn 1 */
+}
+
+void I2C2_EV_IRQHandler(void)
+{
+  /* USER CODE BEGIN I2C2_EV_IRQn 0 */
+  i2c_manager_event_handler(I2C2);
+  /* USER CODE END I2C2_EV_IRQn 0 */
+  /* USER CODE BEGIN I2C2_EV_IRQn 1 */
+  /* USER CODE END I2C2_EV_IRQn 1 */
+}
+
+void I2C2_ER_IRQHandler(void)
+{
+  /* USER CODE BEGIN I2C2_ER_IRQn 0 */
+  i2c_manager_error_handler(I2C2);
+  /* USER CODE END I2C2_ER_IRQn 0 */
+  /* USER CODE BEGIN I2C2_ER_IRQn 1 */
+  /* USER CODE END I2C2_ER_IRQn 1 */
 }
 
 /**

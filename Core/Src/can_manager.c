@@ -279,21 +279,47 @@ can_manager_status_t can_manager_check_ack_timeout(CAN_TypeDef* can, uint32_t ti
 }
 
 can_manager_status_t can_manager_recover(CAN_TypeDef* can){
-  if((can != CAN2) || !can2_context.initialized) return can_manager_not_initialized;
+  /* Onceki recovery denemesi initialized=false birakmis olsa bile tekrar
+   * denenebilmelidir. Context ve task hedefleri varsa manager kurulmustur. */
+  if((can != CAN2) || (can2_context.can != can) ||
+          (can2_context.rx_notification_task == NULL) ||
+          (can2_context.tx_notification_task == NULL)){
+    return can_manager_not_initialized;
+  }
 
   osThreadId_t rx_task = can2_context.rx_notification_task;
   osThreadId_t tx_task = can2_context.tx_notification_task;
+  uint32_t saved_btr = can->BTR;
   g_can2_debug.recovery_attempt_count++;
 
   can2_context.initialized = false;
+  g_can2_debug.initialized = 0U;
   can->IER = 0;
+  can->TSR = CAN_TSR_ABRQ0 | CAN_TSR_ABRQ1 | CAN_TSR_ABRQ2;
   can->MCR |= CAN_MCR_INRQ;
   uint32_t start_tick = osKernelGetTickCount();
   while((can->MSR & CAN_MSR_INAK) == 0){
     if((osKernelGetTickCount() - start_tick) >= CAN_MANAGER_START_TIMEOUT_MS){
-      g_can2_debug.recovery_failure_count++;
-      g_can2_debug.last_status = can_manager_recovery_failed;
-      return can_manager_recovery_failed;
+      /* Hata/bus-off durumundaki controller init istegine cevap vermiyorsa
+       * CAN2'yi donanimsal resetle. Bit timing resetten sonra geri yuklenir. */
+      RCC->APB1RSTR |= RCC_APB1RSTR_CAN2RST;
+      __DSB();
+      RCC->APB1RSTR &= ~RCC_APB1RSTR_CAN2RST;
+      __DSB();
+
+      can->MCR |= CAN_MCR_INRQ;
+      start_tick = osKernelGetTickCount();
+      while((can->MSR & CAN_MSR_INAK) == 0){
+        if((osKernelGetTickCount() - start_tick) >=
+                CAN_MANAGER_START_TIMEOUT_MS){
+          g_can2_debug.recovery_failure_count++;
+          g_can2_debug.last_status = can_manager_recovery_failed;
+          can_manager_refresh_debug(can);
+          return can_manager_recovery_failed;
+        }
+      }
+      can->BTR = saved_btr;
+      break;
     }
   }
 

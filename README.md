@@ -7,8 +7,9 @@ The current full configuration contains:
 | Interface | Devices / node | Execution model |
 |---|---|---|
 | I2C1 | BME280, MPU6500 | Event/error IRQ state machine; RX data phase uses DMA |
-| SPI1 | RC522, nRF24L01 RX | Interrupt/DMA transfers with device-specific chip select |
-| SPI3 | nRF24L01 TX, ILI9341 TFT1, ILI9341 TFT2 | Shared bus, separate CS pins, interrupt/DMA transfers |
+| I2C2 | ADXL345, VL53L0X | Periodic RX DMA for acceleration and ToF ranging results |
+| SPI1 | RC522, one bidirectional nRF24L01 | Shared bus; a single radio-owner task serializes NRF RX/TX mode changes |
+| SPI3 | ILI9341 TFT1, ILI9341 TFT2, SSD1306 SPI | Shared bus, separate CS pins, interrupt/DMA transfers |
 | CAN2 | STM32F103 node through two SN65HVD230 transceivers | Register-level bxCAN, TX/RX/error interrupts |
 
 The STM32F103 test node is kept intentionally simple and uses HAL. The STM32F407 side is the system under study.
@@ -35,13 +36,15 @@ flowchart LR
     SPIQ --> SPIM[SPI manager]
 
     I2CM --> I2C1[I2C1 + DMA1]
+    I2CM --> I2C2[I2C2 + DMA1]
     SPIM --> SPI1[SPI1 + DMA2]
     SPIM --> SPI3[SPI3 + DMA1]
     CANM --> CAN2[bxCAN2]
 
     I2C1 --> I2CDevices[BME280 / MPU6500]
-    SPI1 --> SPI1Devices[RC522 / nRF RX]
-    SPI3 --> SPI3Devices[nRF TX / TFT1 / TFT2]
+    I2C2 --> I2C2Devices[ADXL345 / VL53L0X]
+    SPI1 --> SPI1Devices[RC522 / one bidirectional nRF]
+    SPI3 --> SPI3Devices[TFT1 / TFT2 / SSD1306 SPI]
     CAN2 --> PHY1[SN65HVD230]
     PHY1 <--> Bus[CANH / CANL]
     Bus <--> PHY2[SN65HVD230]
@@ -60,12 +63,13 @@ Each shared peripheral has one software owner:
 
 - Sensor tasks submit jobs and wait for completion flags; they do not manipulate I2C/SPI registers directly.
 - I2C and SPI dispatchers serialize jobs belonging to the same peripheral.
-- I2C1, SPI1, SPI3 and CAN2 can progress independently, so a slow serial bus does not force the CPU or unrelated buses to wait.
+- I2C1, I2C2, SPI1, SPI3 and CAN2 can progress independently, so a slow serial bus does not force the CPU or unrelated buses to wait.
 - Interrupt handlers perform only the time-critical hardware work and notify the corresponding task.
+- The NRF TX task produces requests, while the NRF RX/radio-owner task alone changes CE, CSN and radio mode on the single SPI1 NRF24L01.
 
 ## I2C manager
 
-The I2C1 manager uses an interrupt-driven state machine for START, address, register-address and repeated-START phases. Periodic sensor reads use DMA for the data-register-to-memory portion. The current implementation does **not** claim I2C TX DMA support.
+The multi-bus I2C manager uses an interrupt-driven state machine for START, address, register-address and repeated-START phases. Periodic sensor reads use RX DMA on both I2C1 and I2C2.
 
 It handles:
 
@@ -90,7 +94,7 @@ The manager provides:
 - peripheral recovery
 - post-recovery device validation before a recovery is counted as successful
 
-SPI3 is intentionally shared by nRF24L01 TX and both ILI9341 displays. Serialization prevents their CS windows from overlapping.
+SPI3 is shared by both ILI9341 displays and the SPI SSD1306. SPI1 is shared by RC522 and the single bidirectional NRF24L01. Serialization prevents CS windows from overlapping.
 
 ## CAN manager
 
@@ -135,11 +139,17 @@ Recovery success means more than “the reset function returned”: the correspo
 ## Useful Live Expressions
 
 - `bme280_display_data`
-- `mpu6050_display_data`
+- `mpu6500_display_data`
+- `adxl345_display_data`
 - `nrf24l01_display_data`
 - `rc522_display_data`
 - `ili9341_dma_success_count`
 - `ili9341_dma_error_count`
+- `vl53l0x_display_data`
+- `g_vl53l0x_debug`
+- `vl53l0x_dma_success_count`
+- `vl53l0x_dma_error_count`
+- `ssd1306_spi_refresh_count`
 - `g_can2_debug`
 - `g_can2_last_tx_frame`
 - `g_can2_last_rx_frame`
@@ -165,19 +175,24 @@ The current workspace builds with:
 - STM32Cube FW_F4 V1.28.3
 - FreeRTOS through CMSIS-RTOS v2
 
-Latest local Debug build after the full-device re-enable:
+The current checkout is in staged I2C-only test mode (`I2C_ONLY_TEST = 1`,
+`CAN2_RUNTIME_ENABLED = 0`). SPI/CAN/NRF source code remains present but those
+tasks are not created. Latest local Debug build:
 
 ```text
-text   89136
-data     100
-bss    60500
-total 149736 bytes
+text   69228
+data     180
+bss    52812
+total 122220 bytes
 0 errors, 0 warnings
 ```
 
+The complete configuration was also compiled successfully before selecting
+the staged I2C-only profile.
+
 ## Validation status
 
-The complete configuration has been exercised on assembled hardware for 15 minutes with all enabled devices operating concurrently. During this run, the BME280, MPU6500, RC522, both nRF24L01 paths, both ILI9341 displays and the STM32F407/STM32F103 CAN link operated as expected without an observed communication failure.
+The earlier configuration passed a 15-minute assembled-hardware smoke test. The expanded revision in this repository adds I2C2, ADXL345, VL53L0X, an SPI SSD1306 transport and changes the F407 radio topology from two NRF modules to one bidirectional SPI1 NRF. This expanded wiring revision builds cleanly but still requires staged hardware validation.
 
 This is a successful integration/smoke test, not a long-duration endurance or product-qualification test. Multi-hour operation and extended repeated fault injection remain to be documented.
 
@@ -185,9 +200,8 @@ Use [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) for the staged validation p
 
 ## Current limitations
 
-- I2C TX DMA is not implemented.
 - CAN filtering is currently accept-all rather than application-specific.
-- A 15-minute full-load integration test has passed; multi-hour endurance results are not yet recorded.
+- The newly expanded I2C2/VL53L0X/ADXL345 and single-NRF integration has not yet completed its hardware smoke test.
 - Extended repeated multi-bus fault-injection results are not yet recorded.
 - The project is a development/learning platform, not a certified safety product.
 
@@ -196,7 +210,13 @@ Use [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) for the staged validation p
 - `Core/Src/i2c_manager.c`, `Core/Inc/i2c_manager.h`: I2C state machine, DMA receive and recovery
 - `Core/Src/spi_manager.c`, `Core/Inc/spi_manager.h`: SPI DMA manager and recovery
 - `Core/Src/can_manager.c`, `Core/Inc/can_manager.h`: register-level bxCAN manager
+- `Core/Src/adxl345.c`, `Core/Inc/adxl345.h`: I2C2 ADXL345 initialization and RX-DMA job construction
+- `Core/Src/vl53l0x.c`, `Core/Inc/vl53l0x.h`: I2C2 VL53L0X initialization, calibration and RX-DMA ranging results
+- `Core/Src/ssd1306_i2c.c`, `Core/Inc/ssd1306_i2c.h`: retained I2C SSD1306 driver for later reuse
+- `Core/Src/ssd1306_spi.c`, `Core/Inc/ssd1306_spi.h`: SPI SSD1306 framebuffer and DMA jobs
 - `Core/Src/system_health.c`, `Core/Inc/system_health.h`: health state and recovery bookkeeping
 - `Core/Src/main.c`: generated initialization, RTOS task wiring and application integration
+- `companion/arduino_uno_nrf24_node`: Arduino Uno + second NRF24L01 companion sketch
+- `../f103deneme`: STM32F103 HAL CAN companion project (kept beside this project in the workspace)
 - `PIN_MAP.md`: authoritative connection map for this revision
 - `HARDWARE_VALIDATION.md`: hardware test checklist

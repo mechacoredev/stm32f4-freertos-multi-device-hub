@@ -31,6 +31,7 @@ typedef enum{
 
 typedef enum{
 	I2C_JOB_READ_DMA = 0,
+	I2C_JOB_WRITE_DMA,
 	I2C_JOB_READ_POLL,
 	I2C_JOB_WRITE_POLL,
 	I2C_JOB_CHECK_DEVICE
@@ -59,7 +60,8 @@ typedef enum{
 	I2C_MANAGER_OPERATION_READ_POLL,
 	I2C_MANAGER_OPERATION_WRITE_POLL,
 	I2C_MANAGER_OPERATION_CHECK_DEVICE,
-	I2C_MANAGER_OPERATION_READ_DMA
+	I2C_MANAGER_OPERATION_READ_DMA,
+	I2C_MANAGER_OPERATION_WRITE_DMA
 }i2c_manager_operation_t;
 
 typedef enum{
@@ -87,6 +89,11 @@ typedef struct{
 	volatile uint32_t timeout_count;
 	volatile uint32_t nack_count;
 	volatile uint32_t hardware_error_count;
+	volatile uint32_t bus_error_count;
+	volatile uint32_t arbitration_lost_count;
+	volatile uint32_t overrun_count;
+	volatile uint32_t dma_error_count;
+	volatile uint32_t controller_berr_ignored_count;
 	volatile uint32_t controlled_stop_berr_count;
 	volatile uint32_t stop_wait_timeout_count;
 	volatile uint32_t software_reset_count;
@@ -114,6 +121,7 @@ typedef struct{
 	volatile uint32_t last_sr2;
 	volatile uint32_t last_cr1;
 	volatile uint32_t last_cr2;
+	volatile uint32_t last_failure_tick;
 	volatile bool bus_free_after_cleanup;
 }i2c_manager_diagnostics_t;
 
@@ -136,6 +144,9 @@ i2c_manager_return_status i2c_manager_write_poll(I2C_TypeDef* i2c_handle, uint8_
 i2c_manager_return_status i2c_manager_check_device(I2C_TypeDef* i2c_handle, uint8_t dev_addr, uint8_t reg_addr, uint8_t device_id);
 i2c_manager_return_status i2c_manager_execute_polling_job(i2c_job_t* job);
 i2c_manager_return_status i2c_manager_read_dma(DMA_TypeDef* dma_handle, uint32_t dma_stream, I2C_TypeDef* i2c_handle, uint8_t dev_addr, uint8_t reg_addr, uint8_t* rxdata, uint16_t size);
+i2c_manager_return_status i2c_manager_write_dma(DMA_TypeDef* dma_handle,
+		uint32_t dma_stream, I2C_TypeDef* i2c_handle, uint8_t dev_addr,
+		uint8_t control_or_register, uint8_t* txdata, uint16_t size);
 
 // Artık Hangi Hat Olduğunu Sormamız Gerekiyor (YENİ)
 bool i2c_manager_is_dma_busy(I2C_TypeDef* i2c_handle);

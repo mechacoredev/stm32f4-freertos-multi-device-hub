@@ -25,11 +25,15 @@
 #include "bme280.h"
 #include "rc522.h"
 #include "nrf24l01.h"
-#include "mpu6050.h"
+#include "mpu6500.h"
 #include "ili9341.h"
 #include "system_health.h"
 #include "string.h"
 #include "can_manager.h"
+#include "adxl345.h"
+#include "vl53l0x.h"
+#include "ssd1306_spi.h"
+#include "stdio.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -60,7 +64,7 @@ typedef struct{
   float gyro_dps[3];
   bool valid;
   uint32_t update_count;
-}mpu6050_display_data_t;
+}mpu6500_display_data_t;
 
 typedef struct{
   char tx_text[NRF24L01_PAYLOAD_SIZE + 1];
@@ -74,10 +78,44 @@ typedef struct{
 }nrf24l01_display_data_t;
 
 typedef struct{
+  char tx_text[17];
+  char rx_text[17];
+  uint32_t tx_update_count;
+  uint32_t rx_update_count;
+}can_display_data_t;
+
+typedef struct{
+  volatile uint32_t can_rx_last_tick;
+  volatile uint32_t nrf_rx_last_tick;
+  volatile uint32_t nrf_reinit_attempt_count;
+  volatile uint32_t nrf_reinit_success_count;
+  volatile uint32_t nrf_reinit_failure_count;
+  volatile bool can_rx_timeout;
+  volatile bool nrf_rx_timeout;
+}communication_link_debug_t;
+
+typedef struct{
   bool card_found;
   char block_text[17];
   uint32_t update_count;
 }rc522_display_data_t;
+
+typedef struct{
+  float x_g;
+  float y_g;
+  float z_g;
+  bool valid;
+  uint32_t update_count;
+}adxl345_display_data_t;
+
+typedef struct{
+  uint16_t distance_mm;
+  uint8_t range_status;
+  bool valid;
+  uint32_t update_count;
+  uint32_t last_success_tick;
+  uint32_t error_count;
+}vl53l0x_display_data_t;
 
 typedef struct{
   uint32_t scl_level;
@@ -95,6 +133,11 @@ typedef struct{
   uint32_t completed_count;
   uint32_t timeout_count;
   uint32_t hardware_error_count;
+  uint32_t bus_error_count;
+  uint32_t arbitration_lost_count;
+  uint32_t overrun_count;
+  uint32_t dma_error_count;
+  uint32_t controller_berr_ignored_count;
   uint32_t stop_wait_timeout_count;
   uint32_t software_reset_count;
   uint32_t physical_recovery_count;
@@ -113,11 +156,18 @@ typedef struct{
   runtime_i2c_debug_t i2c1;
   uint32_t bme280_update_count;
   uint32_t bme280_data_age_ms;
-  uint32_t mpu6050_update_count;
-  uint32_t mpu6050_data_age_ms;
-  uint32_t mpu6050_dma_success_count;
-  uint32_t mpu6050_dma_error_count;
-  uint32_t mpu6050_queue_error_count;
+  uint32_t mpu6500_update_count;
+  uint32_t mpu6500_data_age_ms;
+  uint32_t mpu6500_dma_success_count;
+  uint32_t mpu6500_dma_error_count;
+  uint32_t mpu6500_queue_error_count;
+  uint32_t mpu6500_irq_count;
+  uint32_t mpu6500_irq_timeout_count;
+  uint32_t mpu6500_poll_fallback_count;
+  uint32_t mpu6500_int_status_clear_success_count;
+  uint32_t mpu6500_int_status_clear_error_count;
+  uint8_t mpu6500_last_int_status;
+  uint32_t mpu6500_last_irq_tick;
   uint32_t rc522_liveness_age_ms;
   uint32_t rc522_liveness_error_count;
   uint8_t rc522_expected_version;
@@ -146,7 +196,7 @@ typedef struct{
   bool normal_monitoring_started;
   bool watchdog_feed_allowed;
   bool bme280_initialized;
-  bool mpu6050_initialized;
+  bool mpu6500_initialized;
   bool rc522_initialized;
   bool nrf_tx_initialized;
   bool nrf_rx_initialized;
@@ -181,52 +231,93 @@ typedef struct{
 #define BME280_DMA_SUCCESS_FLAG  0x01
 #define BME280_DMA_ERROR_FLAG    0x02
 #define BME280_DMA_ALL_FLAGS     0x03
-#define MPU6050_DATA_READY_FLAG  0x01
-#define MPU6050_DMA_SUCCESS_FLAG 0x02
-#define MPU6050_DMA_ERROR_FLAG   0x04
-#define MPU6050_ALL_FLAGS        0x07
+#define MPU6500_DATA_READY_FLAG  0x01
+#define MPU6500_DMA_SUCCESS_FLAG 0x02
+#define MPU6500_DMA_ERROR_FLAG   0x04
+#define MPU6500_ALL_FLAGS        0x07
+#define ADXL345_DMA_SUCCESS_FLAG 0x01
+#define ADXL345_DMA_ERROR_FLAG   0x02
+#define VL53L0X_DMA_SUCCESS_FLAG 0x01
+#define VL53L0X_DMA_ERROR_FLAG   0x02
+#define SSD1306_SPI_SUCCESS_FLAG 0x01
+#define SSD1306_SPI_ERROR_FLAG   0x02
 
-#define MPU6050_USE_DATA_READY_INTERRUPT 1
-#define I2C_SENSOR_CLIENT_COUNT 2
+#define MPU6500_USE_DATA_READY_INTERRUPT 1
+#define I2C1_SENSOR_CLIENT_COUNT 2
+#define I2C2_SENSOR_CLIENT_COUNT 2
 #define I2C_SENSOR_ERROR_BACKOFF_MS 50
 #define SENSOR_DATA_STALE_TIMEOUT_MS 2000
 #define RC522_LIVENESS_CHECK_PERIOD_MS 1000
 #define RC522_LIVENESS_STALE_TIMEOUT_MS 3000
 #define NRF_PROGRESS_STALE_TIMEOUT_MS 4000
+#define NRF_RADIO_IRQ_FLAG 0x01
+#define NRF_RADIO_DMA_SUCCESS_FLAG 0x02
+#define NRF_RADIO_DMA_ERROR_FLAG 0x04
+#define NRF_RADIO_TX_REQUEST_FLAG 0x08
 #define DISPLAY_PROGRESS_STALE_TIMEOUT_MS 2000
 #define WATCHDOG_STARTUP_GRACE_MS 5000
 #define BUS_RECOVERY_RETRY_PERIOD_MS 1000
 #define BUS_RECOVERY_RESET_TIMEOUT_MS 30000
 #define CAN_ACK_TIMEOUT_MS 3000
+#define COMMUNICATION_PERIOD_MS 500
+#define COMMUNICATION_RX_TIMEOUT_MS 750
+#define NRF_REINIT_RETRY_MS 1000
 #define SENSOR_STALE_BME280_MASK 0x01
-#define SENSOR_STALE_MPU6050_MASK 0x02
+#define SENSOR_STALE_MPU6500_MASK 0x02
 #define SPI_STALE_RC522_MASK 0x04
 #define SPI_STALE_NRF_TX_MASK 0x08
 #define SPI_STALE_NRF_RX_MASK 0x10
 #define SPI_STALE_DISPLAY_MASK 0x20
+#define SENSOR_STALE_ADXL345_MASK 0x40
+#define SENSOR_STALE_VL53L0X_MASK 0x80
+#define SPI_STALE_SSD1306_MASK 0x100
 
-/* 0: tum cihazlar aktif, 1: yalnizca I2C1 uzerindeki BME280/MPU6500 ve CAN2. */
-#define REDUCED_I2C_CAN_TEST 0
+/* Tam sistem dogrulamasi: I2C sensorleri, SPI1 RC522/tek NRF, SPI3 iki
+ * ILI9341/SSD1306 ve CAN2 ayni firmware icinde etkindir. */
+#define I2C_ONLY_TEST 0
+#define CAN2_RUNTIME_ENABLED 1
 
-#if REDUCED_I2C_CAN_TEST
+/* Tam sistem videosu: NRF ve CAN task heartbeat'leri, veri ilerlemesi,
+ * baslatma sonucu ve bus hata/recovery durumlari watchdog kapsamindadir. */
+#define WATCHDOG_MONITOR_NRF 1
+#define WATCHDOG_MONITOR_CAN 1
+
+#if WATCHDOG_MONITOR_NRF
+#define NRF_HEALTH_TASK_MASK \
+  (SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_NRF_TX) | \
+   SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_NRF_RX))
+#else
+#define NRF_HEALTH_TASK_MASK 0U
+#endif
+
+#if WATCHDOG_MONITOR_CAN
+#define CAN_HEALTH_TASK_MASK \
+  (SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_CAN_RX) | \
+   SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_CAN_TX))
+#else
+#define CAN_HEALTH_TASK_MASK 0U
+#endif
+
+#if I2C_ONLY_TEST
 #define ACTIVE_HEALTH_MASK \
   (SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_BME280) | \
-   SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_MPU6050) | \
+   SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_MPU6500) | \
    SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_I2C_DISPATCH) | \
-   SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_CAN_RX) | \
-   SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_CAN_TX))
+   SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_ADXL345) | \
+   SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_VL53L0X))
 #else
 #define ACTIVE_HEALTH_MASK \
   (SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_BME280) | \
-   SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_MPU6050) | \
+   SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_MPU6500) | \
    SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_I2C_DISPATCH) | \
    SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_RC522) | \
    SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_SPI_DISPATCH) | \
-   SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_NRF_TX) | \
-   SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_NRF_RX) | \
+   NRF_HEALTH_TASK_MASK | \
    SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_DISPLAY) | \
-   SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_CAN_RX) | \
-   SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_CAN_TX))
+   SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_ADXL345) | \
+   SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_VL53L0X) | \
+   SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_SSD1306_SPI) | \
+   CAN_HEALTH_TASK_MASK)
 #endif
 
 /* USER CODE END PD */
@@ -260,10 +351,10 @@ const osThreadAttr_t rc522task_attributes = {
   .stack_size = 256 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
-/* Definitions for mpu6050task */
-osThreadId_t mpu6050taskHandle;
-const osThreadAttr_t mpu6050task_attributes = {
-  .name = "mpu6050task",
+/* Definitions for mpu6500task */
+osThreadId_t mpu6500taskHandle;
+const osThreadAttr_t mpu6500task_attributes = {
+  .name = "mpu6500task",
   .stack_size = 512 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
@@ -316,6 +407,22 @@ const osThreadAttr_t CAN2WriteTask_attributes = {
   .stack_size = 256 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
+/* Definitions for ADXL345 and VL53L0X tasks */
+osThreadId_t adxl345taskHandle;
+const osThreadAttr_t adxl345task_attributes = {
+  .name = "adxl345task", .stack_size = 384 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+osThreadId_t vl53l0xtaskHandle;
+const osThreadAttr_t vl53l0xtask_attributes = {
+  .name = "vl53l0xtask", .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+osThreadId_t ssd1306spitaskHandle;
+const osThreadAttr_t ssd1306spitask_attributes = {
+  .name = "ssd1306spi", .stack_size = 384 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
 /* Definitions for i2c_job_queue */
 osMessageQueueId_t i2c_job_queueHandle;
 const osMessageQueueAttr_t i2c_job_queue_attributes = {
@@ -336,6 +443,10 @@ osMutexId_t i2c_init_mutexHandle;
 const osMutexAttr_t i2c_init_mutex_attributes = {
   .name = "i2c_init_mutex"
 };
+osMutexId_t i2c2_mutexHandle;
+const osMutexAttr_t i2c2_mutex_attributes = { .name = "i2c2_mutex" };
+osMutexId_t nrf_mode_mutexHandle;
+const osMutexAttr_t nrf_mode_mutex_attributes = { .name = "nrf_mode_mutex" };
 /* Definitions for spi_mutex */
 osMutexId_t spi_mutexHandle;
 const osMutexAttr_t spi_mutex_attributes = {
@@ -361,6 +472,10 @@ osSemaphoreId_t dma_semaphoreHandle;
 const osSemaphoreAttr_t dma_semaphore_attributes = {
   .name = "dma_semaphore"
 };
+osSemaphoreId_t i2c2_dma_semaphoreHandle;
+const osSemaphoreAttr_t i2c2_dma_semaphore_attributes = {
+  .name = "i2c2_dma_semaphore"
+};
 /* Definitions for spi_semaphore */
 osSemaphoreId_t spi_semaphoreHandle;
 const osSemaphoreAttr_t spi_semaphore_attributes = {
@@ -379,11 +494,29 @@ const osSemaphoreAttr_t spi2_semaphore_attributes = {
 /* USER CODE BEGIN PV */
 bme280_handle_t my_bme280 = NULL;
 rc522_handle_t my_rc522 = NULL;
-mpu6050_handle_t my_mpu6050 = NULL;
+mpu6500_handle_t my_mpu6500 = NULL;
 nrf24l01_handle_t my_nrf2401 = NULL;
 uint8_t sayac=0;
 nrf24l01_handle_t my_nrf_tx = NULL;
 nrf24l01_handle_t my_nrf_rx = NULL;
+uint8_t nrf_pending_tx[NRF24L01_PAYLOAD_SIZE] = {0};
+uint8_t nrf_pending_tx_length = 0;
+volatile bool nrf_tx_request_pending = false;
+adxl345_handle_t my_adxl345 = NULL;
+vl53l0x_handle_t my_vl53l0x = NULL;
+ssd1306_spi_handle_t my_ssd1306_spi = NULL;
+adxl345_display_data_t adxl345_display_data = {0};
+volatile bool adxl345_init_completed = false;
+volatile bool vl53l0x_init_completed = false;
+volatile bool ssd1306_spi_init_completed = false;
+volatile uint32_t adxl345_dma_success_count = 0;
+volatile uint32_t adxl345_dma_error_count = 0;
+volatile uint32_t vl53l0x_dma_success_count = 0;
+volatile uint32_t vl53l0x_dma_error_count = 0;
+volatile uint32_t ssd1306_spi_refresh_count = 0;
+volatile uint32_t adxl345_last_success_tick = 0;
+volatile uint32_t vl53l0x_last_success_tick = 0;
+volatile uint32_t ssd1306_spi_last_success_tick = 0;
 volatile uint32_t nrf_tx_success_count = 0;
 volatile uint32_t nrf_tx_error_count = 0;
 volatile uint32_t nrf_rx_packet_count = 0;
@@ -413,6 +546,10 @@ volatile uint32_t i2c_init_mutex_release_count = 0;
 const char* volatile i2c_init_mutex_owner_name = NULL;
 volatile bool i2c_runtime_ready = false;
 volatile uint32_t i2c_sensor_client_ready_count = 0;
+volatile uint32_t i2c1_sensor_client_ready_count = 0;
+volatile uint32_t i2c2_sensor_client_ready_count = 0;
+volatile bool i2c1_runtime_ready = false;
+volatile bool i2c2_runtime_ready = false;
 volatile uint32_t i2c_runtime_start_count = 0;
 volatile uint32_t i2c_polling_job_count = 0;
 volatile uint32_t i2c_dma_job_count = 0;
@@ -428,19 +565,28 @@ volatile uint32_t ili9341_dma_success_count = 0;
 volatile uint32_t ili9341_dma_error_count = 0;
 volatile ili9341_return_status ili9341_last_status = _ili9341_ok;
 bme280_display_data_t bme280_display_data = {0};
-mpu6050_display_data_t mpu6050_display_data = {0};
+mpu6500_display_data_t mpu6500_display_data = {0};
 nrf24l01_display_data_t nrf24l01_display_data = {0};
 rc522_display_data_t rc522_display_data = {0};
+can_display_data_t can_display_data = {0};
+volatile communication_link_debug_t g_communication_link_debug = {0};
+volatile vl53l0x_display_data_t vl53l0x_display_data = {0};
 volatile bool bme280_init_completed = false;
-volatile bool mpu6050_init_completed = false;
-volatile uint32_t mpu6050_dma_success_count = 0;
-volatile uint32_t mpu6050_dma_error_count = 0;
-volatile uint32_t mpu6050_queue_error_count = 0;
-volatile uint32_t mpu6050_irq_level_recovery_count = 0;
-volatile bool mpu6050_startup_int_clear_success = false;
-volatile bool mpu6050_startup_int_was_data_ready = false;
+volatile bool mpu6500_init_completed = false;
+volatile uint32_t mpu6500_dma_success_count = 0;
+volatile uint32_t mpu6500_dma_error_count = 0;
+volatile uint32_t mpu6500_queue_error_count = 0;
+volatile uint32_t mpu6500_irq_level_recovery_count = 0;
+volatile uint32_t mpu6500_irq_timeout_count = 0;
+volatile uint32_t mpu6500_poll_fallback_count = 0;
+volatile uint32_t mpu6500_int_status_clear_success_count = 0;
+volatile uint32_t mpu6500_int_status_clear_error_count = 0;
+volatile uint8_t mpu6500_last_int_status = 0;
+volatile uint32_t mpu6500_last_irq_tick = 0;
+volatile bool mpu6500_startup_int_clear_success = false;
+volatile bool mpu6500_startup_int_was_data_ready = false;
 volatile uint32_t bme280_last_success_tick = 0;
-volatile uint32_t mpu6050_last_success_tick = 0;
+volatile uint32_t mpu6500_last_success_tick = 0;
 volatile uint32_t rc522_last_liveness_tick = 0;
 volatile uint32_t rc522_liveness_error_count = 0;
 volatile uint8_t rc522_last_observed_version = 0;
@@ -469,13 +615,16 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_I2C1_Init(void);
+static void MX_I2C2_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_SPI3_Init(void);
+#if CAN2_RUNTIME_ENABLED
 static void MX_CAN2_Init(void);
+#endif
 void startbme280task(void *argument);
 void starti2cdmatask(void *argument);
 void startrc522task(void *argument);
-void startmpu6050task(void *argument);
+void startmpu6500task(void *argument);
 void startspidmatask(void *argument);
 void startnrf24l01TXtask(void *argument);
 void startnrf24l01RXtask(void *argument);
@@ -483,11 +632,15 @@ void startili9341task(void *argument);
 void starthealthtask(void *argument);
 void StartCAN2ReadTask(void *argument);
 void StartCAN2WriteTask(void *argument);
+void startadxl345task(void *argument);
+void startvl53l0xtask(void *argument);
+void startssd1306spitask(void *argument);
 
 /* USER CODE BEGIN PFP */
 
 static int8_t get_i2c_dispatch_index(I2C_TypeDef* i2c_handle);
 static bool recover_i2c1_bus_once(void);
+static bool recover_i2c2_bus_runtime(I2C_TypeDef* i2c);
 static int8_t get_spi_dispatch_index(SPI_TypeDef* spi_handle);
 static osStatus_t submit_i2c_dma_job(i2c_job_t* job);
 static osStatus_t submit_spi_dma_job(spi_job_t* job);
@@ -501,12 +654,10 @@ static ili9341_return_status draw_ili9341_colored_text(
 static ili9341_return_status draw_sensor_display_layout(void);
 static ili9341_return_status refresh_bme280_display(
         const bme280_display_data_t* data);
-static ili9341_return_status refresh_mpu6050_display(
-        const mpu6050_display_data_t* data);
-static ili9341_return_status refresh_nrf_tx_display(
-        const nrf24l01_display_data_t* data);
-static ili9341_return_status refresh_nrf_rx_display(
-        const nrf24l01_display_data_t* data);
+static ili9341_return_status refresh_mpu6500_display(
+        const mpu6500_display_data_t* data);
+static ili9341_return_status refresh_adxl345_display(
+        const adxl345_display_data_t* data);
 static ili9341_return_status refresh_rc522_display(
         const rc522_display_data_t* data);
 static void format_fixed_2(char* output, uint8_t field_width,
@@ -643,6 +794,44 @@ static bool recover_i2c1_bus_runtime(I2C_TypeDef* i2c){
   return recovered;
 }
 
+static bool recover_i2c2_bus_runtime(I2C_TypeDef* i2c){
+  if(i2c != I2C2) return false;
+  const uint32_t scl_pin = LL_GPIO_PIN_10;
+  const uint32_t sda_pin = LL_GPIO_PIN_11;
+  LL_GPIO_InitTypeDef gpio = {0};
+
+  LL_APB1_GRP1_ForceReset(LL_APB1_GRP1_PERIPH_I2C2);
+  LL_APB1_GRP1_ReleaseReset(LL_APB1_GRP1_PERIPH_I2C2);
+  LL_GPIO_SetOutputPin(GPIOB, scl_pin | sda_pin);
+  gpio.Pin = scl_pin | sda_pin;
+  gpio.Mode = LL_GPIO_MODE_OUTPUT;
+  gpio.Speed = LL_GPIO_SPEED_FREQ_HIGH;
+  gpio.OutputType = LL_GPIO_OUTPUT_OPENDRAIN;
+  gpio.Pull = LL_GPIO_PULL_UP;
+  LL_GPIO_Init(GPIOB, &gpio);
+  startup_delay_us(20);
+
+  for(uint32_t pulse = 0;
+      pulse < 9 && LL_GPIO_IsInputPinSet(GPIOB, sda_pin) == 0;
+      pulse++){
+    LL_GPIO_ResetOutputPin(GPIOB, scl_pin);
+    startup_delay_us(10);
+    LL_GPIO_SetOutputPin(GPIOB, scl_pin);
+    startup_delay_us(10);
+  }
+
+  LL_GPIO_ResetOutputPin(GPIOB, sda_pin);
+  startup_delay_us(10);
+  LL_GPIO_SetOutputPin(GPIOB, scl_pin);
+  startup_delay_us(10);
+  LL_GPIO_SetOutputPin(GPIOB, sda_pin);
+  startup_delay_us(10);
+  bool lines_released = LL_GPIO_IsInputPinSet(GPIOB, scl_pin) != 0 &&
+          LL_GPIO_IsInputPinSet(GPIOB, sda_pin) != 0;
+  MX_I2C2_Init();
+  return lines_released && !LL_I2C_IsActiveFlag_BUSY(I2C2);
+}
+
 static int8_t get_spi_dispatch_index(SPI_TypeDef* spi_handle){
   if(spi_handle == SPI1) return 0;
   if(spi_handle == SPI2) return 1;
@@ -652,9 +841,11 @@ static int8_t get_spi_dispatch_index(SPI_TypeDef* spi_handle){
 
 static osStatus_t submit_i2c_dma_job(i2c_job_t* job){
   if(job == NULL) return osErrorParameter;
-  if(job->i2c_handle == I2C1 && i2c_runtime_ready == false){
-    return osErrorResource;
-  }
+
+  /* Bir hattaki sensorun init basarisi, ayni hattaki diger sensorun DMA
+   * istegini engellememelidir. Dispatcher her peripheral icin islemleri
+   * zaten siralastirir; worker-ready bayragi da hat baslangic kurtarmasi
+   * tamamlanmadan sensor task'larini serbest birakmaz. */
 
   osStatus_t queue_status;
   queue_status = osMessageQueuePut(i2c_job_queueHandle, job, 0, 0);
@@ -718,6 +909,13 @@ static void refresh_runtime_debug(uint32_t now,
   g_runtime_debug.i2c1.completed_count = manager->completed_count;
   g_runtime_debug.i2c1.timeout_count = manager->timeout_count;
   g_runtime_debug.i2c1.hardware_error_count = manager->hardware_error_count;
+  g_runtime_debug.i2c1.bus_error_count = manager->bus_error_count;
+  g_runtime_debug.i2c1.arbitration_lost_count =
+          manager->arbitration_lost_count;
+  g_runtime_debug.i2c1.overrun_count = manager->overrun_count;
+  g_runtime_debug.i2c1.dma_error_count = manager->dma_error_count;
+  g_runtime_debug.i2c1.controller_berr_ignored_count =
+          manager->controller_berr_ignored_count;
   g_runtime_debug.i2c1.stop_wait_timeout_count =
           manager->stop_wait_timeout_count;
   g_runtime_debug.i2c1.software_reset_count = manager->software_reset_count;
@@ -738,12 +936,22 @@ static void refresh_runtime_debug(uint32_t now,
   g_runtime_debug.bme280_update_count = bme280_display_data.update_count;
   if(bme280_last_success_tick == 0) g_runtime_debug.bme280_data_age_ms = UINT32_MAX;
   else g_runtime_debug.bme280_data_age_ms = now - bme280_last_success_tick;
-  g_runtime_debug.mpu6050_update_count = mpu6050_display_data.update_count;
-  if(mpu6050_last_success_tick == 0) g_runtime_debug.mpu6050_data_age_ms = UINT32_MAX;
-  else g_runtime_debug.mpu6050_data_age_ms = now - mpu6050_last_success_tick;
-  g_runtime_debug.mpu6050_dma_success_count = mpu6050_dma_success_count;
-  g_runtime_debug.mpu6050_dma_error_count = mpu6050_dma_error_count;
-  g_runtime_debug.mpu6050_queue_error_count = mpu6050_queue_error_count;
+  g_runtime_debug.mpu6500_update_count = mpu6500_display_data.update_count;
+  if(mpu6500_last_success_tick == 0) g_runtime_debug.mpu6500_data_age_ms = UINT32_MAX;
+  else g_runtime_debug.mpu6500_data_age_ms = now - mpu6500_last_success_tick;
+  g_runtime_debug.mpu6500_dma_success_count = mpu6500_dma_success_count;
+  g_runtime_debug.mpu6500_dma_error_count = mpu6500_dma_error_count;
+  g_runtime_debug.mpu6500_queue_error_count = mpu6500_queue_error_count;
+  g_runtime_debug.mpu6500_irq_count = mpu6500_irq_count;
+  g_runtime_debug.mpu6500_irq_timeout_count = mpu6500_irq_timeout_count;
+  g_runtime_debug.mpu6500_poll_fallback_count =
+          mpu6500_poll_fallback_count;
+  g_runtime_debug.mpu6500_int_status_clear_success_count =
+          mpu6500_int_status_clear_success_count;
+  g_runtime_debug.mpu6500_int_status_clear_error_count =
+          mpu6500_int_status_clear_error_count;
+  g_runtime_debug.mpu6500_last_int_status = mpu6500_last_int_status;
+  g_runtime_debug.mpu6500_last_irq_tick = mpu6500_last_irq_tick;
   if(rc522_last_liveness_tick == 0) g_runtime_debug.rc522_liveness_age_ms = UINT32_MAX;
   else g_runtime_debug.rc522_liveness_age_ms = now - rc522_last_liveness_tick;
   g_runtime_debug.rc522_liveness_error_count =
@@ -763,7 +971,8 @@ static void refresh_runtime_debug(uint32_t now,
   g_runtime_debug.ili9341_dma_success_count = ili9341_dma_success_count;
   g_runtime_debug.ili9341_dma_error_count = ili9341_dma_error_count;
   g_runtime_debug.stale_sensor_mask = stale_mask &
-          (SENSOR_STALE_BME280_MASK | SENSOR_STALE_MPU6050_MASK);
+          (SENSOR_STALE_BME280_MASK | SENSOR_STALE_MPU6500_MASK |
+           SENSOR_STALE_ADXL345_MASK);
   g_runtime_debug.stale_subsystem_mask = stale_mask;
   g_runtime_debug.sensor_data_fresh =
           g_runtime_debug.stale_sensor_mask == 0;
@@ -785,7 +994,7 @@ static void refresh_runtime_debug(uint32_t now,
   g_runtime_debug.watchdog_feed_allowed =
           health_watchdog_feed_allowed;
   g_runtime_debug.bme280_initialized = bme280_init_completed;
-  g_runtime_debug.mpu6050_initialized = mpu6050_init_completed;
+  g_runtime_debug.mpu6500_initialized = mpu6500_init_completed;
   g_runtime_debug.rc522_initialized = rc522_init_completed;
   g_runtime_debug.nrf_tx_initialized = nrf_tx_init_completed;
   g_runtime_debug.nrf_rx_initialized = nrf_rx_init_completed;
@@ -811,21 +1020,36 @@ static void release_i2c_init_lock(void){
   }
 }
 
-static void register_i2c_sensor_client_ready(void){
-  /* Sensor tasks call this while holding i2c_init_mutex. The last required
-   * client releases both tasks into their periodic DMA phase. */
-  if(i2c_sensor_client_ready_count < I2C_SENSOR_CLIENT_COUNT){
-    i2c_sensor_client_ready_count++;
+static void register_i2c_sensor_client_ready(I2C_TypeDef* i2c){
+  /* Her fiziksel I2C hatti yalnizca kendi istemcilerini bekler. I2C2'deki
+     eksik bir cihaz I2C1 sensorlerinin runtime fazini bloke edemez. */
+  if(i2c == I2C1){
+    if(i2c1_sensor_client_ready_count < I2C1_SENSOR_CLIENT_COUNT){
+      i2c1_sensor_client_ready_count++;
+      i2c_sensor_client_ready_count++;
+    }
+    if(i2c1_sensor_client_ready_count >= I2C1_SENSOR_CLIENT_COUNT &&
+            !i2c1_runtime_ready){
+      i2c1_runtime_ready = true;
+      i2c_runtime_start_count++;
+      osThreadFlagsSet(bme280taskHandle, I2C_RUNTIME_READY_FLAG);
+      osThreadFlagsSet(mpu6500taskHandle, I2C_RUNTIME_READY_FLAG);
+    }
   }
-  if(i2c_sensor_client_ready_count < I2C_SENSOR_CLIENT_COUNT ||
-          i2c_runtime_ready){
-    return;
+  else if(i2c == I2C2){
+    if(i2c2_sensor_client_ready_count < I2C2_SENSOR_CLIENT_COUNT){
+      i2c2_sensor_client_ready_count++;
+      i2c_sensor_client_ready_count++;
+    }
+    if(i2c2_sensor_client_ready_count >= I2C2_SENSOR_CLIENT_COUNT &&
+            !i2c2_runtime_ready){
+      i2c2_runtime_ready = true;
+      i2c_runtime_start_count++;
+      osThreadFlagsSet(adxl345taskHandle, I2C_RUNTIME_READY_FLAG);
+      osThreadFlagsSet(vl53l0xtaskHandle, I2C_RUNTIME_READY_FLAG);
+    }
   }
-
-  i2c_runtime_ready = true;
-  i2c_runtime_start_count++;
-  osThreadFlagsSet(bme280taskHandle, I2C_RUNTIME_READY_FLAG);
-  osThreadFlagsSet(mpu6050taskHandle, I2C_RUNTIME_READY_FLAG);
+  i2c_runtime_ready = i2c1_runtime_ready && i2c2_runtime_ready;
 }
 
 static osStatus_t submit_spi_dma_job(spi_job_t* job){
@@ -997,15 +1221,44 @@ static void format_fixed_2(char* output, uint8_t field_width,
   format_text_field(output, field_width, formatted_value);
 }
 
+static void format_fixed_3(char* output, uint8_t field_width,
+        float value, const char* unit){
+  if(output == NULL || unit == NULL || field_width == 0) return;
+
+  bool negative = value < 0.0f;
+  float absolute_value = negative ? -value : value;
+  uint32_t scaled_value = (uint32_t)(absolute_value * 1000.0f + 0.5f);
+  uint32_t integer_part = scaled_value / 1000;
+  uint32_t fraction_part = scaled_value % 1000;
+
+  char formatted_value[32];
+  uint8_t output_index = 0;
+  if(negative) formatted_value[output_index++] = '-';
+
+  output_index = append_unsigned_number(formatted_value, output_index,
+          integer_part);
+  formatted_value[output_index++] = '.';
+  formatted_value[output_index++] = '0' + (fraction_part / 100);
+  formatted_value[output_index++] = '0' + ((fraction_part / 10) % 10);
+  formatted_value[output_index++] = '0' + (fraction_part % 10);
+  formatted_value[output_index++] = ' ';
+
+  uint8_t unit_index = 0;
+  while(unit[unit_index] != '\0' && output_index < sizeof(formatted_value) - 1){
+    formatted_value[output_index++] = unit[unit_index++];
+  }
+  formatted_value[output_index] = '\0';
+
+  format_text_field(output, field_width, formatted_value);
+}
+
 static ili9341_return_status draw_sensor_display_layout(void){
   ili9341_return_status display_status;
   char wait_bme[16];
   char wait_mpu[11];
-  char wait_radio[23];
   char wait_card[22];
   format_text_field(wait_bme, 15, "WAIT");
   format_text_field(wait_mpu, 10, "WAIT");
-  format_text_field(wait_radio, 22, "WAIT");
   format_text_field(wait_card, 21, "WAIT");
 
   display_status = draw_ili9341_text(my_tft1, 124, 8, "BME280");
@@ -1022,49 +1275,49 @@ static ili9341_return_status draw_sensor_display_layout(void){
   if(display_status != _ili9341_ok) return display_status;
   display_status = draw_ili9341_text(my_tft1, 60, 88, wait_bme);
   if(display_status != _ili9341_ok) return display_status;
-  display_status = draw_ili9341_text(my_tft1, 0, 120, "NRF TX:");
+  display_status = draw_ili9341_text(my_tft1, 112, 120, "MPU6500");
   if(display_status != _ili9341_ok) return display_status;
-  display_status = draw_ili9341_text(my_tft1, 84, 120, wait_radio);
+  display_status = draw_ili9341_text(my_tft1, 0, 144, "IVME");
   if(display_status != _ili9341_ok) return display_status;
-  display_status = draw_ili9341_text(my_tft1, 124, 152, "RC522");
-  if(display_status != _ili9341_ok) return display_status;
-  display_status = draw_ili9341_text(my_tft1, 0, 176,
-          "KART: BEKLENIYOR          ");
-  if(display_status != _ili9341_ok) return display_status;
-  display_status = draw_ili9341_text(my_tft1, 0, 208, "DATA:");
-  if(display_status != _ili9341_ok) return display_status;
-  display_status = draw_ili9341_text(my_tft1, 60, 208, wait_card);
+  display_status = draw_ili9341_text(my_tft1, 160, 144, "JIRO");
   if(display_status != _ili9341_ok) return display_status;
 
-  display_status = draw_ili9341_text(my_tft2, 112, 8, "MPU6500");
-  if(display_status != _ili9341_ok) return display_status;
-  display_status = draw_ili9341_text(my_tft2, 0, 40, "IVME");
-  if(display_status != _ili9341_ok) return display_status;
-  display_status = draw_ili9341_text(my_tft2, 160, 40, "JIRO");
-  if(display_status != _ili9341_ok) return display_status;
-
-  const uint16_t mpu_y_positions[3] = {64, 88, 112};
+  const uint16_t mpu_y_positions[3] = {168, 192, 216};
   const char* axis_labels[3] = {"X:", "Y:", "Z:"};
   for(uint8_t index = 0; index < 3; index++){
-    display_status = draw_ili9341_text(my_tft2, 0,
+    display_status = draw_ili9341_text(my_tft1, 0,
             mpu_y_positions[index], axis_labels[index]);
     if(display_status != _ili9341_ok) return display_status;
-    display_status = draw_ili9341_text(my_tft2, 36,
+    display_status = draw_ili9341_text(my_tft1, 36,
             mpu_y_positions[index], wait_mpu);
     if(display_status != _ili9341_ok) return display_status;
-    display_status = draw_ili9341_text(my_tft2, 160,
+    display_status = draw_ili9341_text(my_tft1, 160,
             mpu_y_positions[index], axis_labels[index]);
     if(display_status != _ili9341_ok) return display_status;
-    display_status = draw_ili9341_text(my_tft2, 196,
+    display_status = draw_ili9341_text(my_tft1, 196,
             mpu_y_positions[index], wait_mpu);
     if(display_status != _ili9341_ok) return display_status;
   }
 
-  display_status = draw_ili9341_text(my_tft2, 0, 160, "NRF RX:");
+  display_status = draw_ili9341_text(my_tft2, 112, 8, "ADXL345");
   if(display_status != _ili9341_ok) return display_status;
-  display_status = draw_ili9341_text(my_tft2, 84, 160, wait_radio);
+  for(uint8_t index = 0; index < 3; index++){
+    display_status = draw_ili9341_text(my_tft2, 0, 40 + index * 24,
+            axis_labels[index]);
+    if(display_status != _ili9341_ok) return display_status;
+    display_status = draw_ili9341_text(my_tft2, 36, 40 + index * 24,
+            wait_mpu);
+    if(display_status != _ili9341_ok) return display_status;
+  }
+
+  display_status = draw_ili9341_text(my_tft2, 124, 128, "RC522");
   if(display_status != _ili9341_ok) return display_status;
-  display_status = draw_ili9341_text(my_tft2, 0, 192, "UZUNLUK: WAIT");
+  display_status = draw_ili9341_text(my_tft2, 0, 160,
+          "KART: BEKLENIYOR          ");
+  if(display_status != _ili9341_ok) return display_status;
+  display_status = draw_ili9341_text(my_tft2, 0, 192, "DATA:");
+  if(display_status != _ili9341_ok) return display_status;
+  display_status = draw_ili9341_text(my_tft2, 60, 192, wait_card);
   if(display_status != _ili9341_ok) return display_status;
 
   return _ili9341_ok;
@@ -1090,24 +1343,26 @@ static ili9341_return_status refresh_bme280_display(
   return display_status;
 }
 
-static ili9341_return_status refresh_mpu6050_display(
-        const mpu6050_display_data_t* data){
+static ili9341_return_status refresh_mpu6500_display(
+        const mpu6500_display_data_t* data){
   if(data == NULL || data->valid == false) return _ili9341_fail;
 
-  const uint16_t y_positions[3] = {64, 88, 112};
+  const uint16_t y_positions[3] = {168, 192, 216};
   char value_text[11];
   ili9341_return_status display_status = _ili9341_ok;
 
   for(uint8_t index = 0; index < 3; index++){
-    format_fixed_2(value_text, 10, data->accel_g[index], "g");
-    display_status = draw_ili9341_text(my_tft2, 36,
+    /* Yatay eksenlerdeki kucuk fakat gecerli olcumleri 0.00'a
+     * yuvarlayip kaybetmemek icin ivmeyi uc ondalikla goster. */
+    format_fixed_3(value_text, 10, data->accel_g[index], "g");
+    display_status = draw_ili9341_text(my_tft1, 36,
             y_positions[index], value_text);
     if(display_status != _ili9341_ok) return display_status;
   }
 
   for(uint8_t index = 0; index < 3; index++){
     format_fixed_2(value_text, 10, data->gyro_dps[index], "dps");
-    display_status = draw_ili9341_text(my_tft2, 196,
+    display_status = draw_ili9341_text(my_tft1, 196,
             y_positions[index], value_text);
     if(display_status != _ili9341_ok) return display_status;
   }
@@ -1115,32 +1370,19 @@ static ili9341_return_status refresh_mpu6050_display(
   return _ili9341_ok;
 }
 
-static ili9341_return_status refresh_nrf_tx_display(
-        const nrf24l01_display_data_t* data){
-  if(data == NULL || data->tx_valid == false) return _ili9341_fail;
-  char text_field[23];
-  format_text_field(text_field, 22, data->tx_text);
-  return draw_ili9341_text(my_tft1, 84, 120, text_field);
-}
+static ili9341_return_status refresh_adxl345_display(
+        const adxl345_display_data_t* data){
+  if(data == NULL || data->valid == false) return _ili9341_fail;
 
-static ili9341_return_status refresh_nrf_rx_display(
-        const nrf24l01_display_data_t* data){
-  if(data == NULL || data->rx_valid == false) return _ili9341_fail;
-
-  char text_field[20];
-  format_text_field(text_field, 19, data->rx_text);
-  ili9341_return_status display_status;
-  display_status = draw_ili9341_text(my_tft2, 84, 160, text_field);
-  if(display_status != _ili9341_ok) return display_status;
-
-  char length_text[4] = {0};
-  uint8_t length_index = 0;
-  length_index = append_unsigned_number(length_text, length_index,
-          data->rx_length);
-  length_text[length_index] = '\0';
-  char length_field[4];
-  format_text_field(length_field, 3, length_text);
-  return draw_ili9341_text(my_tft2, 108, 192, length_field);
+  const float values[3] = {data->x_g, data->y_g, data->z_g};
+  char value_text[11];
+  for(uint8_t index = 0; index < 3; index++){
+    format_fixed_2(value_text, 10, values[index], "g");
+    ili9341_return_status display_status = draw_ili9341_text(my_tft2, 36,
+            40 + index * 24, value_text);
+    if(display_status != _ili9341_ok) return display_status;
+  }
+  return _ili9341_ok;
 }
 
 static ili9341_return_status refresh_rc522_display(
@@ -1149,15 +1391,15 @@ static ili9341_return_status refresh_rc522_display(
 
   ili9341_return_status display_status;
   if(data->card_found == false){
-    display_status = draw_ili9341_text(my_tft1, 0, 176,
+    display_status = draw_ili9341_text(my_tft2, 0, 160,
             "KART: YOK                 ");
     if(display_status != _ili9341_ok) return display_status;
 
-    return draw_ili9341_text(my_tft1, 60, 208,
+    return draw_ili9341_text(my_tft2, 60, 192,
             "                     ");
   }
 
-  display_status = draw_ili9341_text(my_tft1, 0, 176,
+  display_status = draw_ili9341_text(my_tft2, 0, 160,
           "KART: BULUNDU             ");
   if(display_status != _ili9341_ok) return display_status;
 
@@ -1167,7 +1409,7 @@ static ili9341_return_status refresh_rc522_display(
   if(strncmp(data->block_text, "Mavi", 4) == 0){
     text_color = ILI9341_COLOR_BLUE;
   }
-  return draw_ili9341_colored_text(my_tft1, 60, 208, text_field,
+  return draw_ili9341_colored_text(my_tft2, 60, 192, text_field,
           text_color);
 }
 
@@ -1235,9 +1477,12 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_I2C1_Init();
+  MX_I2C2_Init();
   MX_SPI1_Init();
   MX_SPI3_Init();
+#if CAN2_RUNTIME_ENABLED
   MX_CAN2_Init();
+#endif
   /* USER CODE BEGIN 2 */
   i2c1_startup_sr2_after = I2C1->SR2;
   i2c1_startup_recovery_success = i2c1_startup_recovery_success &&
@@ -1253,6 +1498,10 @@ int main(void)
 
   /* creation of i2c_init_mutex */
   i2c_init_mutexHandle = osMutexNew(&i2c_init_mutex_attributes);
+
+  i2c2_mutexHandle = osMutexNew(&i2c2_mutex_attributes);
+
+  nrf_mode_mutexHandle = osMutexNew(&nrf_mode_mutex_attributes);
 
   /* creation of spi_mutex */
   spi_mutexHandle = osMutexNew(&spi_mutex_attributes);
@@ -1273,6 +1522,9 @@ int main(void)
   /* creation of dma_semaphore */
   dma_semaphoreHandle = osSemaphoreNew(1, 1, &dma_semaphore_attributes);
 
+  i2c2_dma_semaphoreHandle = osSemaphoreNew(1, 1,
+          &i2c2_dma_semaphore_attributes);
+
   /* creation of spi_semaphore */
   spi_semaphoreHandle = osSemaphoreNew(1, 1, &spi_semaphore_attributes);
 
@@ -1286,6 +1538,8 @@ int main(void)
   /* add semaphores, ... */
   i2c_manager_assign_bus(I2C1, i2c_mutexHandle, dma_semaphoreHandle);
   i2c_manager_set_bus_recovery(I2C1, recover_i2c1_bus_runtime);
+  i2c_manager_assign_bus(I2C2, i2c2_mutexHandle, i2c2_dma_semaphoreHandle);
+  i2c_manager_set_bus_recovery(I2C2, recover_i2c2_bus_runtime);
   spi_manager_assign_bus(SPI1, spi_mutexHandle, spi_semaphoreHandle);
   spi_manager_assign_bus(SPI3, spi3_mutexHandle, spi3_semaphoreHandle);
   /* USER CODE END RTOS_SEMAPHORES */
@@ -1312,30 +1566,30 @@ int main(void)
   i2cdmataskHandle = osThreadNew(starti2cdmatask, NULL, &i2cdmatask_attributes);
 
   /* creation of rc522task */
-#if !REDUCED_I2C_CAN_TEST
+#if !I2C_ONLY_TEST
   rc522taskHandle = osThreadNew(startrc522task, NULL, &rc522task_attributes);
 #endif
 
-  /* creation of mpu6050task */
-  mpu6050taskHandle = osThreadNew(startmpu6050task, NULL, &mpu6050task_attributes);
+  /* creation of mpu6500task */
+  mpu6500taskHandle = osThreadNew(startmpu6500task, NULL, &mpu6500task_attributes);
 
   /* creation of spidmatask */
-#if !REDUCED_I2C_CAN_TEST
+#if !I2C_ONLY_TEST
   spidmataskHandle = osThreadNew(startspidmatask, NULL, &spidmatask_attributes);
 #endif
 
   /* creation of nrf24l01TXtask */
-#if !REDUCED_I2C_CAN_TEST
+#if !I2C_ONLY_TEST
   nrf24l01TXtaskHandle = osThreadNew(startnrf24l01TXtask, NULL, &nrf24l01TXtask_attributes);
 #endif
 
   /* creation of nrf24l01RXtask */
-#if !REDUCED_I2C_CAN_TEST
+#if !I2C_ONLY_TEST
   nrf24l01RXtaskHandle = osThreadNew(startnrf24l01RXtask, NULL, &nrf24l01RXtask_attributes);
 #endif
 
   /* creation of ili9341task */
-#if !REDUCED_I2C_CAN_TEST
+#if !I2C_ONLY_TEST
   ili9341taskHandle = osThreadNew(startili9341task, NULL, &ili9341task_attributes);
 #endif
 
@@ -1343,26 +1597,44 @@ int main(void)
   healthtaskHandle = osThreadNew(starthealthtask, NULL, &healthtask_attributes);
 
   /* creation of CAN2ReadTask */
+#if CAN2_RUNTIME_ENABLED
   CAN2ReadTaskHandle = osThreadNew(StartCAN2ReadTask, NULL, &CAN2ReadTask_attributes);
+#endif
 
   /* creation of CAN2WriteTask */
+#if CAN2_RUNTIME_ENABLED
   CAN2WriteTaskHandle = osThreadNew(StartCAN2WriteTask, NULL, &CAN2WriteTask_attributes);
+#endif
+
+  adxl345taskHandle = osThreadNew(startadxl345task, NULL,
+          &adxl345task_attributes);
+  vl53l0xtaskHandle = osThreadNew(startvl53l0xtask, NULL,
+          &vl53l0xtask_attributes);
+#if !I2C_ONLY_TEST
+  ssd1306spitaskHandle = osThreadNew(startssd1306spitask, NULL,
+          &ssd1306spitask_attributes);
+#endif
 
   /* USER CODE BEGIN RTOS_THREADS */
   system_health_register_task(HEALTH_TASK_BME280, bme280taskHandle);
   system_health_register_task(HEALTH_TASK_I2C_DISPATCH, i2cdmataskHandle);
-#if !REDUCED_I2C_CAN_TEST
+#if !I2C_ONLY_TEST
   system_health_register_task(HEALTH_TASK_RC522, rc522taskHandle);
 #endif
-  system_health_register_task(HEALTH_TASK_MPU6050, mpu6050taskHandle);
-#if !REDUCED_I2C_CAN_TEST
+  system_health_register_task(HEALTH_TASK_MPU6500, mpu6500taskHandle);
+#if !I2C_ONLY_TEST
   system_health_register_task(HEALTH_TASK_SPI_DISPATCH, spidmataskHandle);
   system_health_register_task(HEALTH_TASK_NRF_TX, nrf24l01TXtaskHandle);
   system_health_register_task(HEALTH_TASK_NRF_RX, nrf24l01RXtaskHandle);
   system_health_register_task(HEALTH_TASK_DISPLAY, ili9341taskHandle);
+  system_health_register_task(HEALTH_TASK_SSD1306_SPI, ssd1306spitaskHandle);
 #endif
+  system_health_register_task(HEALTH_TASK_ADXL345, adxl345taskHandle);
+  system_health_register_task(HEALTH_TASK_VL53L0X, vl53l0xtaskHandle);
+#if CAN2_RUNTIME_ENABLED
   system_health_register_task(HEALTH_TASK_CAN_RX, CAN2ReadTaskHandle);
   system_health_register_task(HEALTH_TASK_CAN_TX, CAN2WriteTaskHandle);
+#endif
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -1439,6 +1711,7 @@ void SystemClock_Config(void)
   * @param None
   * @retval None
   */
+#if CAN2_RUNTIME_ENABLED
 static void MX_CAN2_Init(void)
 {
 
@@ -1470,6 +1743,7 @@ static void MX_CAN2_Init(void)
   /* USER CODE END CAN2_Init 2 */
 
 }
+#endif
 
 /**
   * @brief I2C1 Initialization Function
@@ -1551,6 +1825,67 @@ static void MX_I2C1_Init(void)
 
   /* USER CODE END I2C1_Init 2 */
 
+}
+
+/**
+  * @brief I2C2 Initialization Function (PB10=SCL, PB11=SDA)
+  */
+static void MX_I2C2_Init(void)
+{
+  LL_I2C_InitTypeDef I2C_InitStruct = {0};
+  LL_GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_GPIOB);
+  GPIO_InitStruct.Pin = LL_GPIO_PIN_10 | LL_GPIO_PIN_11;
+  GPIO_InitStruct.Mode = LL_GPIO_MODE_ALTERNATE;
+  GPIO_InitStruct.Speed = LL_GPIO_SPEED_FREQ_VERY_HIGH;
+  GPIO_InitStruct.OutputType = LL_GPIO_OUTPUT_OPENDRAIN;
+  GPIO_InitStruct.Pull = LL_GPIO_PULL_UP;
+  GPIO_InitStruct.Alternate = LL_GPIO_AF_4;
+  LL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  LL_APB1_GRP1_EnableClock(LL_APB1_GRP1_PERIPH_I2C2);
+
+  LL_DMA_SetChannelSelection(DMA1, LL_DMA_STREAM_3, LL_DMA_CHANNEL_7);
+  LL_DMA_SetDataTransferDirection(DMA1, LL_DMA_STREAM_3,
+          LL_DMA_DIRECTION_PERIPH_TO_MEMORY);
+  LL_DMA_SetStreamPriorityLevel(DMA1, LL_DMA_STREAM_3, LL_DMA_PRIORITY_LOW);
+  LL_DMA_SetMode(DMA1, LL_DMA_STREAM_3, LL_DMA_MODE_NORMAL);
+  LL_DMA_SetPeriphIncMode(DMA1, LL_DMA_STREAM_3, LL_DMA_PERIPH_NOINCREMENT);
+  LL_DMA_SetMemoryIncMode(DMA1, LL_DMA_STREAM_3, LL_DMA_MEMORY_INCREMENT);
+  LL_DMA_SetPeriphSize(DMA1, LL_DMA_STREAM_3, LL_DMA_PDATAALIGN_BYTE);
+  LL_DMA_SetMemorySize(DMA1, LL_DMA_STREAM_3, LL_DMA_MDATAALIGN_BYTE);
+  LL_DMA_DisableFifoMode(DMA1, LL_DMA_STREAM_3);
+
+  LL_DMA_SetChannelSelection(DMA1, LL_DMA_STREAM_7, LL_DMA_CHANNEL_7);
+  LL_DMA_SetDataTransferDirection(DMA1, LL_DMA_STREAM_7,
+          LL_DMA_DIRECTION_MEMORY_TO_PERIPH);
+  LL_DMA_SetStreamPriorityLevel(DMA1, LL_DMA_STREAM_7, LL_DMA_PRIORITY_LOW);
+  LL_DMA_SetMode(DMA1, LL_DMA_STREAM_7, LL_DMA_MODE_NORMAL);
+  LL_DMA_SetPeriphIncMode(DMA1, LL_DMA_STREAM_7, LL_DMA_PERIPH_NOINCREMENT);
+  LL_DMA_SetMemoryIncMode(DMA1, LL_DMA_STREAM_7, LL_DMA_MEMORY_INCREMENT);
+  LL_DMA_SetPeriphSize(DMA1, LL_DMA_STREAM_7, LL_DMA_PDATAALIGN_BYTE);
+  LL_DMA_SetMemorySize(DMA1, LL_DMA_STREAM_7, LL_DMA_MDATAALIGN_BYTE);
+  LL_DMA_DisableFifoMode(DMA1, LL_DMA_STREAM_7);
+
+  NVIC_SetPriority(I2C2_EV_IRQn,
+          NVIC_EncodePriority(NVIC_GetPriorityGrouping(), 5, 0));
+  NVIC_EnableIRQ(I2C2_EV_IRQn);
+  NVIC_SetPriority(I2C2_ER_IRQn,
+          NVIC_EncodePriority(NVIC_GetPriorityGrouping(), 5, 0));
+  NVIC_EnableIRQ(I2C2_ER_IRQn);
+
+  LL_I2C_DisableOwnAddress2(I2C2);
+  LL_I2C_DisableGeneralCall(I2C2);
+  LL_I2C_EnableClockStretching(I2C2);
+  I2C_InitStruct.PeripheralMode = LL_I2C_MODE_I2C;
+  I2C_InitStruct.ClockSpeed = 400000;
+  I2C_InitStruct.DutyCycle = LL_I2C_DUTYCYCLE_2;
+  I2C_InitStruct.OwnAddress1 = 0;
+  I2C_InitStruct.TypeAcknowledge = LL_I2C_ACK;
+  I2C_InitStruct.OwnAddrSize = LL_I2C_OWNADDRESS1_7BIT;
+  LL_I2C_Init(I2C2, &I2C_InitStruct);
+  LL_I2C_SetOwnAddress2(I2C2, 0);
 }
 
 /**
@@ -1769,9 +2104,15 @@ static void MX_DMA_Init(void)
   /* DMA1_Stream2_IRQn interrupt configuration */
   NVIC_SetPriority(DMA1_Stream2_IRQn, NVIC_EncodePriority(NVIC_GetPriorityGrouping(),5, 0));
   NVIC_EnableIRQ(DMA1_Stream2_IRQn);
+  /* I2C2 RX */
+  NVIC_SetPriority(DMA1_Stream3_IRQn, NVIC_EncodePriority(NVIC_GetPriorityGrouping(),5, 0));
+  NVIC_EnableIRQ(DMA1_Stream3_IRQn);
   /* DMA1_Stream5_IRQn interrupt configuration */
   NVIC_SetPriority(DMA1_Stream5_IRQn, NVIC_EncodePriority(NVIC_GetPriorityGrouping(),5, 0));
   NVIC_EnableIRQ(DMA1_Stream5_IRQn);
+  /* I2C2 TX */
+  NVIC_SetPriority(DMA1_Stream7_IRQn, NVIC_EncodePriority(NVIC_GetPriorityGrouping(),5, 0));
+  NVIC_EnableIRQ(DMA1_Stream7_IRQn);
   /* DMA2_Stream0_IRQn interrupt configuration */
   NVIC_SetPriority(DMA2_Stream0_IRQn, NVIC_EncodePriority(NVIC_GetPriorityGrouping(),5, 0));
   NVIC_EnableIRQ(DMA2_Stream0_IRQn);
@@ -1805,7 +2146,7 @@ static void MX_GPIO_Init(void)
   LL_GPIO_ResetOutputPin(GPIOE, TFT1_DC_Pin|TFT2_DC_Pin);
 
   /**/
-  LL_GPIO_ResetOutputPin(nrf24_ce_pin_spi3_GPIO_Port, nrf24_ce_pin_spi3_Pin);
+  LL_GPIO_ResetOutputPin(SSD1306_SPI_DC_GPIO_Port, SSD1306_SPI_DC_Pin);
 
   /**/
   LL_GPIO_ResetOutputPin(nrf24_ce_pin_spi1_GPIO_Port, nrf24_ce_pin_spi1_Pin);
@@ -1814,16 +2155,19 @@ static void MX_GPIO_Init(void)
   LL_GPIO_SetOutputPin(GPIOE, TFT1_RST_Pin|TFT1_CS_Pin|TFT2_RST_Pin|TFT2_CS_Pin);
 
   /**/
-  LL_GPIO_SetOutputPin(nrf24_csn_pin_spi3_GPIO_Port, nrf24_csn_pin_spi3_Pin);
+  LL_GPIO_SetOutputPin(SSD1306_SPI_CS_GPIO_Port,
+          SSD1306_SPI_CS_Pin | SSD1306_SPI_RST_Pin);
 
   /**/
   LL_GPIO_SetOutputPin(GPIOD, nrf24_csn_pin_spi1_Pin|rc522_cs_pin_Pin|rc522_rst_pin_Pin);
 
-  /**/
-  LL_SYSCFG_SetEXTISource(LL_SYSCFG_EXTI_PORTB, LL_SYSCFG_EXTI_LINE1);
+  /* Haberlesme LED'leri baslangicta F103'un ilk fazina uygun olarak
+     CAN LOW, NRF HIGH durumundadir. */
+  LL_GPIO_ResetOutputPin(CAN_LINK_LED_GPIO_Port, CAN_LINK_LED_Pin);
+  LL_GPIO_SetOutputPin(NRF_LINK_LED_GPIO_Port, NRF_LINK_LED_Pin);
 
   /**/
-  LL_SYSCFG_SetEXTISource(LL_SYSCFG_EXTI_PORTC, LL_SYSCFG_EXTI_LINE6);
+  LL_SYSCFG_SetEXTISource(LL_SYSCFG_EXTI_PORTC, LL_SYSCFG_EXTI_LINE7);
 
   /**/
   LL_SYSCFG_SetEXTISource(LL_SYSCFG_EXTI_PORTD, LL_SYSCFG_EXTI_LINE2);
@@ -1832,17 +2176,10 @@ static void MX_GPIO_Init(void)
   LL_SYSCFG_SetEXTISource(LL_SYSCFG_EXTI_PORTD, LL_SYSCFG_EXTI_LINE3);
 
   /**/
-  EXTI_InitStruct.Line_0_31 = LL_EXTI_LINE_1;
+  EXTI_InitStruct.Line_0_31 = LL_EXTI_LINE_7;
   EXTI_InitStruct.LineCommand = ENABLE;
   EXTI_InitStruct.Mode = LL_EXTI_MODE_IT;
   EXTI_InitStruct.Trigger = LL_EXTI_TRIGGER_RISING;
-  LL_EXTI_Init(&EXTI_InitStruct);
-
-  /**/
-  EXTI_InitStruct.Line_0_31 = LL_EXTI_LINE_6;
-  EXTI_InitStruct.LineCommand = ENABLE;
-  EXTI_InitStruct.Mode = LL_EXTI_MODE_IT;
-  EXTI_InitStruct.Trigger = LL_EXTI_TRIGGER_FALLING;
   LL_EXTI_Init(&EXTI_InitStruct);
 
   /**/
@@ -1860,10 +2197,7 @@ static void MX_GPIO_Init(void)
   LL_EXTI_Init(&EXTI_InitStruct);
 
   /**/
-  LL_GPIO_SetPinPull(mpu6050_irq_pin_GPIO_Port, mpu6050_irq_pin_Pin, LL_GPIO_PULL_DOWN);
-
-  /**/
-  LL_GPIO_SetPinPull(nrf24_irq_pin_spi3_GPIO_Port, nrf24_irq_pin_spi3_Pin, LL_GPIO_PULL_UP);
+  LL_GPIO_SetPinPull(mpu6500_irq_pin_GPIO_Port, mpu6500_irq_pin_Pin, LL_GPIO_PULL_DOWN);
 
   /**/
   LL_GPIO_SetPinPull(nrf24_irq_pin_spi1_GPIO_Port, nrf24_irq_pin_spi1_Pin, LL_GPIO_PULL_UP);
@@ -1872,10 +2206,7 @@ static void MX_GPIO_Init(void)
   LL_GPIO_SetPinPull(rc522_irq_pin_GPIO_Port, rc522_irq_pin_Pin, LL_GPIO_PULL_UP);
 
   /**/
-  LL_GPIO_SetPinMode(mpu6050_irq_pin_GPIO_Port, mpu6050_irq_pin_Pin, LL_GPIO_MODE_INPUT);
-
-  /**/
-  LL_GPIO_SetPinMode(nrf24_irq_pin_spi3_GPIO_Port, nrf24_irq_pin_spi3_Pin, LL_GPIO_MODE_INPUT);
+  LL_GPIO_SetPinMode(mpu6500_irq_pin_GPIO_Port, mpu6500_irq_pin_Pin, LL_GPIO_MODE_INPUT);
 
   /**/
   LL_GPIO_SetPinMode(nrf24_irq_pin_spi1_GPIO_Port, nrf24_irq_pin_spi1_Pin, LL_GPIO_MODE_INPUT);
@@ -1893,23 +2224,17 @@ static void MX_GPIO_Init(void)
   LL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
   /**/
-  GPIO_InitStruct.Pin = nrf24_csn_pin_spi3_Pin;
+  GPIO_InitStruct.Pin = SSD1306_SPI_CS_Pin | SSD1306_SPI_DC_Pin |
+          SSD1306_SPI_RST_Pin;
   GPIO_InitStruct.Mode = LL_GPIO_MODE_OUTPUT;
   GPIO_InitStruct.Speed = LL_GPIO_SPEED_FREQ_HIGH;
   GPIO_InitStruct.OutputType = LL_GPIO_OUTPUT_PUSHPULL;
   GPIO_InitStruct.Pull = LL_GPIO_PULL_NO;
-  LL_GPIO_Init(nrf24_csn_pin_spi3_GPIO_Port, &GPIO_InitStruct);
+  LL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
   /**/
-  GPIO_InitStruct.Pin = nrf24_ce_pin_spi3_Pin;
-  GPIO_InitStruct.Mode = LL_GPIO_MODE_OUTPUT;
-  GPIO_InitStruct.Speed = LL_GPIO_SPEED_FREQ_MEDIUM;
-  GPIO_InitStruct.OutputType = LL_GPIO_OUTPUT_PUSHPULL;
-  GPIO_InitStruct.Pull = LL_GPIO_PULL_NO;
-  LL_GPIO_Init(nrf24_ce_pin_spi3_GPIO_Port, &GPIO_InitStruct);
-
-  /**/
-  GPIO_InitStruct.Pin = nrf24_ce_pin_spi1_Pin|rc522_cs_pin_Pin|rc522_rst_pin_Pin;
+  GPIO_InitStruct.Pin = nrf24_ce_pin_spi1_Pin|rc522_cs_pin_Pin|rc522_rst_pin_Pin|
+          CAN_LINK_LED_Pin|NRF_LINK_LED_Pin;
   GPIO_InitStruct.Mode = LL_GPIO_MODE_OUTPUT;
   GPIO_InitStruct.Speed = LL_GPIO_SPEED_FREQ_MEDIUM;
   GPIO_InitStruct.OutputType = LL_GPIO_OUTPUT_PUSHPULL;
@@ -1925,15 +2250,12 @@ static void MX_GPIO_Init(void)
   LL_GPIO_Init(nrf24_csn_pin_spi1_GPIO_Port, &GPIO_InitStruct);
 
   /* EXTI interrupt init*/
-  NVIC_SetPriority(EXTI1_IRQn, NVIC_EncodePriority(NVIC_GetPriorityGrouping(),5, 0));
-  NVIC_EnableIRQ(EXTI1_IRQn);
   NVIC_SetPriority(EXTI2_IRQn, NVIC_EncodePriority(NVIC_GetPriorityGrouping(),5, 0));
   NVIC_EnableIRQ(EXTI2_IRQn);
   NVIC_SetPriority(EXTI3_IRQn, NVIC_EncodePriority(NVIC_GetPriorityGrouping(),5, 0));
   NVIC_EnableIRQ(EXTI3_IRQn);
   NVIC_SetPriority(EXTI9_5_IRQn, NVIC_EncodePriority(NVIC_GetPriorityGrouping(),5, 0));
   NVIC_EnableIRQ(EXTI9_5_IRQn);
-
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
   // Ekranlar SPI3'u ayri CS pinleriyle ortak kullanıyor. İkisini de başlangıçta seçimsiz bırak.
@@ -1986,22 +2308,17 @@ void startbme280task(void *argument)
 	bme_cfg.ctrlmeas_t.bits.osrs_p = 1;
 	bme_cfg.ctrlmeas_t.bits.mode = 3;
 
-	if(!acquire_i2c_init_lock()){
-	  for(;;) osDelay(1000);
-	}
-
-	my_bme280 = bme280_init(&bme_cfg);
-
-	if(my_bme280 == NULL){
+	while(my_bme280 == NULL){
+	  system_health_heartbeat(HEALTH_TASK_BME280);
+	  if(acquire_i2c_init_lock()){
+	    my_bme280 = bme280_init(&bme_cfg);
 	    release_i2c_init_lock();
-	    for(;;){
-	      osDelay(1000);
-	    }
+	  }
+	  if(my_bme280 == NULL) osDelay(1000);
 	}
 	bme280_init_completed = true;
 	bme280_last_success_tick = osKernelGetTickCount();
-	register_i2c_sensor_client_ready();
-	release_i2c_init_lock();
+	register_i2c_sensor_client_ready(I2C1);
 
 	uint32_t runtime_flags = osThreadFlagsWait(I2C_RUNTIME_READY_FLAG,
 	        osFlagsWaitAny, osWaitForever);
@@ -2087,12 +2404,9 @@ void starti2cdmatask(void *argument)
   while(osSemaphoreAcquire(dma_semaphoreHandle, 0) == osOK) { }
   osThreadFlagsClear(I2C_DMA_ALL_FLAGS);
 
-  bool startup_bus_ready = i2c1_startup_recovery_completed &&
-          i2c1_startup_recovery_success;
-  if(startup_bus_ready){
-    osThreadFlagsSet(bme280taskHandle, I2C_WORKER_READY_FLAG);
-    osThreadFlagsSet(mpu6050taskHandle, I2C_WORKER_READY_FLAG);
-  }
+  bool i2c1_workers_released = false;
+  bool i2c2_workers_released = false;
+  uint32_t next_startup_retry_tick = 0;
 
   /* Infinite loop */
   for(;;)
@@ -2103,6 +2417,36 @@ void starti2cdmatask(void *argument)
     bool flag_wait_error = (pending_flags & osFlagsError) != 0;
     if(flag_wait_error) pending_flags = 0;
     uint32_t now = osKernelGetTickCount();
+
+    /* Her I2C hatti kendi basina hazirlanir. Bir hattin fiziksel arizasi,
+     * diger hattaki sensor task'larinin baslamasini engellemez. */
+    if((int32_t)(now - next_startup_retry_tick) >= 0){
+      if(!i2c1_workers_released){
+        bool i2c1_ready = i2c1_startup_recovery_completed &&
+                i2c1_startup_recovery_success;
+        if(!i2c1_ready){
+          i2c1_ready = i2c_manager_recover_bus(I2C1) ==
+                  _i2c_manager_ok;
+        }
+        if(i2c1_ready){
+          osThreadFlagsSet(bme280taskHandle, I2C_WORKER_READY_FLAG);
+          osThreadFlagsSet(mpu6500taskHandle, I2C_WORKER_READY_FLAG);
+          i2c1_workers_released = true;
+        }
+      }
+
+      if(!i2c2_workers_released){
+        bool i2c2_ready = i2c_manager_recover_bus(I2C2) ==
+                _i2c_manager_ok;
+        if(i2c2_ready){
+          osThreadFlagsSet(adxl345taskHandle, I2C_WORKER_READY_FLAG);
+          osThreadFlagsSet(vl53l0xtaskHandle, I2C_WORKER_READY_FLAG);
+          i2c2_workers_released = true;
+        }
+      }
+
+      next_startup_retry_tick = now + 1000;
+    }
 
     for(uint8_t index = 0; index < 3; index++){
       bool transfer_finished = (pending_flags & completion_flags[index]) != 0;
@@ -2140,7 +2484,8 @@ void starti2cdmatask(void *argument)
         continue;
       }
 
-      bool polling_job = job.operation != I2C_JOB_READ_DMA;
+      bool polling_job = job.operation != I2C_JOB_READ_DMA &&
+              job.operation != I2C_JOB_WRITE_DMA;
       if(polling_job){
         if(active_jobs[dispatch_index].active){
           requeue_i2c_job(&job);
@@ -2175,9 +2520,16 @@ void starti2cdmatask(void *argument)
       active_jobs[dispatch_index].job = job;
 
       i2c_manager_return_status transfer_status;
-      transfer_status = i2c_manager_read_dma(job.dma_handle, job.dma_stream,
-                                             job.i2c_handle, job.dev_addr,
-                                             job.reg_addr, job.rxdata, job.size);
+      if(job.operation == I2C_JOB_WRITE_DMA){
+        transfer_status = i2c_manager_write_dma(job.dma_handle,
+                job.dma_stream, job.i2c_handle, job.dev_addr,
+                job.reg_addr, job.txdata, job.size);
+      }
+      else{
+        transfer_status = i2c_manager_read_dma(job.dma_handle,
+                job.dma_stream, job.i2c_handle, job.dev_addr,
+                job.reg_addr, job.rxdata, job.size);
+      }
       if(transfer_status == _i2c_manager_ok){
         i2c_dma_job_count++;
         refresh_i2c_dma_debug(active_jobs);
@@ -2218,20 +2570,13 @@ void startrc522task(void *argument)
 	rc522_cfg.rst_port = rc522_rst_pin_GPIO_Port;
 	rc522_cfg.rst_pin = rc522_rst_pin_Pin;
 
-	my_rc522 = rc522_init(&rc522_cfg);
-
-	if(my_rc522 == NULL){
-		for(;;){
-		  osDelay(1000);
-		}
+	while(my_rc522 == NULL){
+	  system_health_heartbeat(HEALTH_TASK_RC522);
+	  my_rc522 = rc522_init(&rc522_cfg);
+	  if(my_rc522 == NULL) osDelay(1000);
 	}
 	rc522_version = rc522_get_version(my_rc522);
 	rc522_last_observed_version = rc522_version;
-	if(rc522_version == 0 || rc522_version == 0xFF){
-		for(;;){
-		  osDelay(1000);
-		}
-	}
 	rc522_init_completed = true;
 	(void)spi_manager_register_validator(SPI1, validate_rc522_spi, my_rc522);
 	rc522_last_liveness_tick = osKernelGetTickCount();
@@ -2266,6 +2611,9 @@ void startrc522task(void *argument)
 	uint32_t next_liveness_check_tick = osKernelGetTickCount();
 	bool card_display_active = false;
 	uint8_t displayed_card_uid[5] = {0};
+	bool card_present = false;
+	uint8_t last_detected_uid[5] = {0};
+	uint32_t consecutive_protocol_error_count = 0;
 
   /* Infinite loop */
   for(;;)
@@ -2292,14 +2640,27 @@ void startrc522task(void *argument)
 
 	  status = rc522_request(my_rc522, PICC_REQALL, card_type);
 	  rc522_last_request_status = status;
+	  if(status == MI_ERROR) consecutive_protocol_error_count++;
+	  else consecutive_protocol_error_count = 0;
 	  if(status == MI_OK){
 		  status = rc522_anticoll(my_rc522, card_uid);
 		  rc522_last_anticoll_status = status;
+		  if(status == MI_ERROR) consecutive_protocol_error_count++;
+		  else consecutive_protocol_error_count = 0;
 		  if(status == MI_OK){
+			  bool new_card_event = card_present == false ||
+			          memcmp(last_detected_uid, card_uid,
+			                  sizeof(last_detected_uid)) != 0;
+			  last_card_seen_tick = osKernelGetTickCount();
+			  if(new_card_event){
+			    rc522_detection_count++;
+			    memcpy(last_detected_uid, card_uid,
+			            sizeof(last_detected_uid));
+			  }
+			  card_present = true;
 			  for(uint8_t uid_index = 0; uid_index < 5; uid_index++){
 				  rc522_last_uid[uid_index] = card_uid[uid_index];
 			  }
-			  rc522_detection_count++;
 
 			  if((card_uid[0] == 193) && (card_uid[1] == 99) && (card_uid[2] == 247) && (card_uid[3] == 3) && (card_uid[4] == 86)){
 				  card_size = rc522_select_tag(my_rc522, card_uid);
@@ -2372,9 +2733,17 @@ void startrc522task(void *argument)
 			  }
 		  }
 	  }
+	  if(consecutive_protocol_error_count >= 5U){
+	    (void)rc522_recover(my_rc522);
+	    consecutive_protocol_error_count = 0;
+	    rc522_last_observed_version = rc522_get_version(my_rc522);
+	  }
+
 	  uint32_t now = osKernelGetTickCount();
-	  if(card_display_active &&
+	  if((card_present || card_display_active) &&
 	     (now - last_card_seen_tick) >= card_absent_timeout_ms){
+	    card_present = false;
+	    memset(last_detected_uid, 0, sizeof(last_detected_uid));
 	    osStatus_t mutex_status;
 	    mutex_status = osMutexAcquire(sensor_data_mutexHandle, 10);
 	    if(mutex_status == osOK){
@@ -2392,26 +2761,26 @@ void startrc522task(void *argument)
   /* USER CODE END startrc522task */
 }
 
-/* USER CODE BEGIN Header_startmpu6050task */
+/* USER CODE BEGIN Header_startmpu6500task */
 /**
-* @brief Function implementing the mpu6050task thread.
+* @brief Function implementing the mpu6500task thread.
 * @param argument: Not used
 * @retval None
 */
-/* USER CODE END Header_startmpu6050task */
-void startmpu6050task(void *argument)
+/* USER CODE END Header_startmpu6500task */
+void startmpu6500task(void *argument)
 {
-  /* USER CODE BEGIN startmpu6050task */
+  /* USER CODE BEGIN startmpu6500task */
 	uint32_t startup_flags = osThreadFlagsWait(I2C_WORKER_READY_FLAG,
 	        osFlagsWaitAny, osWaitForever);
 	if((startup_flags & I2C_WORKER_READY_FLAG) == 0){
 	  for(;;) osDelay(1000);
 	}
 
-	mpu6050_user_configs mpu_cfg = {0};
+	mpu6500_user_configs mpu_cfg = {0};
 
 	mpu_cfg.i2c_handle = I2C1;
-	mpu_cfg.i2c_addr = mpu6050_i2c_addr_0;
+	mpu_cfg.i2c_addr = mpu6500_i2c_addr_0;
 	mpu_cfg.dma_handle = DMA1;
 	mpu_cfg.dma_stream = LL_DMA_STREAM_0;
 	mpu_cfg.sample_rate = 9;
@@ -2425,11 +2794,13 @@ void startmpu6050task(void *argument)
 	mpu_cfg.fifo_en_t.raw = 0;
 	mpu_cfg.user_ctrl_t.raw = 0;
 
-#if MPU6050_USE_DATA_READY_INTERRUPT
+#if MPU6500_USE_DATA_READY_INTERRUPT
 	mpu_cfg.int_pin_cfg_t.bits.int_level = 0;
 	mpu_cfg.int_pin_cfg_t.bits.int_open = 0;
 	mpu_cfg.int_pin_cfg_t.bits.latch_int_en = 1;
-	mpu_cfg.int_pin_cfg_t.bits.int_rd_clear = 1;
+	/* Veri register'larinin okunmasi interrupt'i temizlemesin. DMA veri
+	 * transferinden sonra INT_STATUS ayrica okunarak latch temizlenecek. */
+	mpu_cfg.int_pin_cfg_t.bits.int_rd_clear = 0;
 	mpu_cfg.int_enable_t.bits.data_rdy_en = 1;
 #else
 	// Kontrollu A/B testi: MPU interrupt kaynaklari tamamen kapali.
@@ -2443,43 +2814,38 @@ void startmpu6050task(void *argument)
 	mpu_cfg.pwr_mgmt_1_t.bits.cycle = 0;
 	mpu_cfg.pwr_mgmt_2_t.raw = 0;
 
-	if(!acquire_i2c_init_lock()){
-	  for(;;) osDelay(1000);
-	}
-	my_mpu6050 = mpu6050_init(&mpu_cfg);
-	if(my_mpu6050 == NULL){
-		release_i2c_init_lock();
-		for(;;){
-		  osDelay(1000);
-		}
+	bool mpu_configured = false;
+	while(!mpu_configured){
+	  system_health_heartbeat(HEALTH_TASK_MPU6500);
+	  if(acquire_i2c_init_lock()){
+	    if(my_mpu6500 == NULL) my_mpu6500 = mpu6500_init(&mpu_cfg);
+	    if(my_mpu6500 != NULL){
+	      mpu_configured =
+	              mpu6500_configurate(my_mpu6500) == _mpu6500_ok;
+	    }
+	    release_i2c_init_lock();
+	  }
+	  if(!mpu_configured) osDelay(1000);
 	}
 
-#if MPU6050_USE_DATA_READY_INTERRUPT
-	mpu6050_assign_interrupt_task(my_mpu6050, mpu6050taskHandle,
-	        MPU6050_DATA_READY_FLAG);
-	mpu6050_set_active_irq_device(my_mpu6050);
+#if MPU6500_USE_DATA_READY_INTERRUPT
+	mpu6500_assign_interrupt_task(my_mpu6500, mpu6500taskHandle,
+	        MPU6500_DATA_READY_FLAG);
+	mpu6500_set_active_irq_device(my_mpu6500);
 #endif
 
-	if(mpu6050_configurate(my_mpu6050) != _mpu6050_ok){
-		release_i2c_init_lock();
-		for(;;){
-		  osDelay(1000);
-		}
-	}
-
-#if MPU6050_USE_DATA_READY_INTERRUPT
-	mpu6050_int_status_t startup_int_status = {0};
-	mpu6050_startup_int_clear_success =
-	        mpu6050_read_int_status(my_mpu6050, &startup_int_status) ==
-	        _mpu6050_ok;
-	mpu6050_startup_int_was_data_ready = startup_int_status.data_rdy;
-	osThreadFlagsClear(MPU6050_DATA_READY_FLAG);
-	LL_EXTI_ClearFlag_0_31(LL_EXTI_LINE_1);
+#if MPU6500_USE_DATA_READY_INTERRUPT
+	mpu6500_int_status_t startup_int_status = {0};
+	mpu6500_startup_int_clear_success =
+	        mpu6500_read_int_status(my_mpu6500, &startup_int_status) ==
+	        _mpu6500_ok;
+	mpu6500_startup_int_was_data_ready = startup_int_status.data_rdy;
+	osThreadFlagsClear(MPU6500_DATA_READY_FLAG);
+	LL_EXTI_ClearFlag_0_31(LL_EXTI_LINE_7);
 #endif
-	mpu6050_init_completed = true;
-	mpu6050_last_success_tick = osKernelGetTickCount();
-	register_i2c_sensor_client_ready();
-	release_i2c_init_lock();
+	mpu6500_init_completed = true;
+	mpu6500_last_success_tick = osKernelGetTickCount();
+	register_i2c_sensor_client_ready(I2C1);
 
 	uint32_t runtime_flags = osThreadFlagsWait(I2C_RUNTIME_READY_FLAG,
 	        osFlagsWaitAny, osWaitForever);
@@ -2487,144 +2853,164 @@ void startmpu6050task(void *argument)
 	  for(;;) osDelay(1000);
 	}
 
-#if !MPU6050_USE_DATA_READY_INTERRUPT
-	const uint32_t mpu6050_period_ms = 100;
-	uint32_t mpu6050_next_wake = osKernelGetTickCount();
+#if !MPU6500_USE_DATA_READY_INTERRUPT
+	const uint32_t mpu6500_period_ms = 100;
+	uint32_t mpu6500_next_wake = osKernelGetTickCount();
 #endif
 
   /* Infinite loop */
   for(;;)
   {
-	  system_health_heartbeat(HEALTH_TASK_MPU6050);
-#if MPU6050_USE_DATA_READY_INTERRUPT
-	  uint32_t irq_flags = osThreadFlagsWait(MPU6050_DATA_READY_FLAG,
+	  system_health_heartbeat(HEALTH_TASK_MPU6500);
+#if MPU6500_USE_DATA_READY_INTERRUPT
+	  uint32_t irq_flags = osThreadFlagsWait(MPU6500_DATA_READY_FLAG,
 	          osFlagsWaitAny, 100);
-	  bool irq_received = (irq_flags & MPU6050_DATA_READY_FLAG) != 0;
+	  bool irq_received = (irq_flags & MPU6500_DATA_READY_FLAG) != 0;
 	  bool interrupt_pin_high = LL_GPIO_IsInputPinSet(
-	          mpu6050_irq_pin_GPIO_Port, mpu6050_irq_pin_Pin) != 0;
+	          mpu6500_irq_pin_GPIO_Port, mpu6500_irq_pin_Pin) != 0;
 
-	  // Rising edge nadiren kacarsa latched HIGH seviyeyi DMA okumasi ile kurtar.
-	  if(irq_received == false){
-	    if(interrupt_pin_high == false) continue;
-	    mpu6050_irq_level_recovery_count++;
+	  if(irq_received){
+	    mpu6500_last_irq_tick = osKernelGetTickCount();
+	  }
+	  else if(interrupt_pin_high){
+	    /* Rising edge kacmis fakat latched INT seviyesi goruluyor. */
+	    mpu6500_irq_level_recovery_count++;
+	  }
+	  else{
+	    /* Ne EXTI flag'i ne de HIGH seviyesi var. INT kablosu/kenari kaybolsa
+	     * bile MPU veri akisini tamamen durdurma; 100 ms'de bir DMA okuyarak
+	     * sistemi calisir tut ve olayi ayri sayaclarda gorunur yap. */
+	    mpu6500_irq_timeout_count++;
+	    mpu6500_poll_fallback_count++;
 	  }
 
-	  // Tek etkin MPU kaynagi DATA_READY. INT_RD_CLEAR=1 oldugu icin bu
-	  // 14-baytlik register okumasi interrupt latch'ini de otomatik temizler.
+	  // Tek etkin MPU kaynagi DATA_READY. INT_RD_CLEAR=0: once 14 baytlik
+	  // veri okunur, sonra INT_STATUS ayrica okunarak interrupt temizlenir.
 	  i2c_job_t job;
-	  osThreadFlagsClear(MPU6050_DMA_SUCCESS_FLAG |
-	          MPU6050_DMA_ERROR_FLAG);
-	  mpu6050_return_status build_status;
-	  build_status = mpu6050_build_data_job(my_mpu6050,
-	          mpu6050taskHandle, MPU6050_DMA_SUCCESS_FLAG,
-	          MPU6050_DMA_ERROR_FLAG, &job);
-	  if(build_status != _mpu6050_ok){
-	    mpu6050_dma_error_count++;
+	  osThreadFlagsClear(MPU6500_DMA_SUCCESS_FLAG |
+	          MPU6500_DMA_ERROR_FLAG);
+	  mpu6500_return_status build_status;
+	  build_status = mpu6500_build_data_job(my_mpu6500,
+	          mpu6500taskHandle, MPU6500_DMA_SUCCESS_FLAG,
+	          MPU6500_DMA_ERROR_FLAG, &job);
+	  if(build_status != _mpu6500_ok){
+	    mpu6500_dma_error_count++;
 	    osDelay(I2C_SENSOR_ERROR_BACKOFF_MS);
 	    continue;
 	  }
 
 	  if(submit_i2c_dma_job(&job) != osOK){
-	    mpu6050_queue_error_count++;
+	    mpu6500_queue_error_count++;
 	    osDelay(I2C_SENSOR_ERROR_BACKOFF_MS);
 	    continue;
 	  }
 
 	  uint32_t dma_flags = osThreadFlagsWait(
-	          MPU6050_DMA_SUCCESS_FLAG | MPU6050_DMA_ERROR_FLAG,
+	          MPU6500_DMA_SUCCESS_FLAG | MPU6500_DMA_ERROR_FLAG,
 	          osFlagsWaitAny, 500);
 	  bool wait_error = (dma_flags & osFlagsError) != 0;
-	  bool dma_finished = (dma_flags & MPU6050_DMA_SUCCESS_FLAG) != 0;
+	  bool dma_finished = (dma_flags & MPU6500_DMA_SUCCESS_FLAG) != 0;
 	  if(wait_error || dma_finished == false){
-	    mpu6050_dma_error_count++;
+	    mpu6500_dma_error_count++;
 	    osDelay(I2C_SENSOR_ERROR_BACKOFF_MS);
 	    continue;
 	  }
 
-	  if(mpu6050_get_values(my_mpu6050) != _mpu6050_ok){
-	    mpu6050_dma_error_count++;
+	  mpu6500_int_status_t runtime_int_status = {0};
+	  if(mpu6500_read_int_status(my_mpu6500, &runtime_int_status) !=
+	          _mpu6500_ok){
+	    mpu6500_int_status_clear_error_count++;
+	    mpu6500_dma_error_count++;
 	    osDelay(I2C_SENSOR_ERROR_BACKOFF_MS);
 	    continue;
 	  }
-	  mpu6050_last_success_tick = osKernelGetTickCount();
+	  mpu6500_last_int_status = runtime_int_status.raw;
+	  mpu6500_int_status_clear_success_count++;
+
+	  if(mpu6500_get_values(my_mpu6500) != _mpu6500_ok){
+	    mpu6500_dma_error_count++;
+	    osDelay(I2C_SENSOR_ERROR_BACKOFF_MS);
+	    continue;
+	  }
+	  mpu6500_last_success_tick = osKernelGetTickCount();
 
 	  float accel[3];
 	  float gyro[3];
-	  mpu6050_get_accel_g(my_mpu6050, accel);
-	  mpu6050_get_gyro_dps(my_mpu6050, gyro);
+	  mpu6500_get_accel_g(my_mpu6500, accel);
+	  mpu6500_get_gyro_dps(my_mpu6500, gyro);
 
 	  osStatus_t mutex_status;
 	  mutex_status = osMutexAcquire(sensor_data_mutexHandle, 10);
 	  if(mutex_status == osOK){
 	    for(uint8_t index = 0; index < 3; index++){
-	      mpu6050_display_data.accel_g[index] = accel[index];
-	      mpu6050_display_data.gyro_dps[index] = gyro[index];
+	      mpu6500_display_data.accel_g[index] = accel[index];
+	      mpu6500_display_data.gyro_dps[index] = gyro[index];
 	    }
-	    mpu6050_display_data.valid = true;
-	    mpu6050_display_data.update_count++;
+	    mpu6500_display_data.valid = true;
+	    mpu6500_display_data.update_count++;
 	    osMutexRelease(sensor_data_mutexHandle);
-	    mpu6050_dma_success_count++;
+	    mpu6500_dma_success_count++;
 	  }
 #else
-	  mpu6050_next_wake += mpu6050_period_ms;
-	  osDelayUntil(mpu6050_next_wake);
+	  mpu6500_next_wake += mpu6500_period_ms;
+	  osDelayUntil(mpu6500_next_wake);
 
 	  i2c_job_t job;
-	  osThreadFlagsClear(MPU6050_ALL_FLAGS);
-	  mpu6050_return_status build_status;
-	  build_status = mpu6050_build_data_job(my_mpu6050,
-	          mpu6050taskHandle, MPU6050_DMA_SUCCESS_FLAG,
-	          MPU6050_DMA_ERROR_FLAG, &job);
-	  if(build_status != _mpu6050_ok){
-	    mpu6050_dma_error_count++;
+	  osThreadFlagsClear(MPU6500_ALL_FLAGS);
+	  mpu6500_return_status build_status;
+	  build_status = mpu6500_build_data_job(my_mpu6500,
+	          mpu6500taskHandle, MPU6500_DMA_SUCCESS_FLAG,
+	          MPU6500_DMA_ERROR_FLAG, &job);
+	  if(build_status != _mpu6500_ok){
+	    mpu6500_dma_error_count++;
 	    osDelay(I2C_SENSOR_ERROR_BACKOFF_MS);
 	    continue;
 	  }
 
 	  if(submit_i2c_dma_job(&job) != osOK){
-	    mpu6050_queue_error_count++;
+	    mpu6500_queue_error_count++;
 	    osDelay(I2C_SENSOR_ERROR_BACKOFF_MS);
 	    continue;
 	  }
 
 	  uint32_t dma_flags = osThreadFlagsWait(
-	          MPU6050_DMA_SUCCESS_FLAG | MPU6050_DMA_ERROR_FLAG,
+	          MPU6500_DMA_SUCCESS_FLAG | MPU6500_DMA_ERROR_FLAG,
 	          osFlagsWaitAny, 500);
 	  bool wait_error = (dma_flags & osFlagsError) != 0;
-	  bool dma_finished = (dma_flags & MPU6050_DMA_SUCCESS_FLAG) != 0;
+	  bool dma_finished = (dma_flags & MPU6500_DMA_SUCCESS_FLAG) != 0;
 	  if(wait_error || dma_finished == false){
-	    mpu6050_dma_error_count++;
+	    mpu6500_dma_error_count++;
 	    osDelay(I2C_SENSOR_ERROR_BACKOFF_MS);
 	    continue;
 	  }
 
-	  if(mpu6050_get_values(my_mpu6050) != _mpu6050_ok){
-	    mpu6050_dma_error_count++;
+	  if(mpu6500_get_values(my_mpu6500) != _mpu6500_ok){
+	    mpu6500_dma_error_count++;
 	    osDelay(I2C_SENSOR_ERROR_BACKOFF_MS);
 	    continue;
 	  }
-	  mpu6050_last_success_tick = osKernelGetTickCount();
+	  mpu6500_last_success_tick = osKernelGetTickCount();
 
 	  float accel[3];
 	  float gyro[3];
-	  mpu6050_get_accel_g(my_mpu6050, accel);
-	  mpu6050_get_gyro_dps(my_mpu6050, gyro);
+	  mpu6500_get_accel_g(my_mpu6500, accel);
+	  mpu6500_get_gyro_dps(my_mpu6500, gyro);
 
 	  osStatus_t mutex_status;
 	  mutex_status = osMutexAcquire(sensor_data_mutexHandle, 10);
 	  if(mutex_status == osOK){
 	    for(uint8_t index = 0; index < 3; index++){
-	      mpu6050_display_data.accel_g[index] = accel[index];
-	      mpu6050_display_data.gyro_dps[index] = gyro[index];
+	      mpu6500_display_data.accel_g[index] = accel[index];
+	      mpu6500_display_data.gyro_dps[index] = gyro[index];
 	    }
-	    mpu6050_display_data.valid = true;
-	    mpu6050_display_data.update_count++;
+	    mpu6500_display_data.valid = true;
+	    mpu6500_display_data.update_count++;
 	    osMutexRelease(sensor_data_mutexHandle);
-	    mpu6050_dma_success_count++;
+	    mpu6500_dma_success_count++;
 	  }
 #endif
   }
-  /* USER CODE END startmpu6050task */
+  /* USER CODE END startmpu6500task */
 }
 
 /* USER CODE BEGIN Header_startspidmatask */
@@ -2768,154 +3154,54 @@ void startspidmatask(void *argument)
 void startnrf24l01TXtask(void *argument)
 {
   /* USER CODE BEGIN startnrf24l01TXtask */
-  // Iki task ayni statik nRF havuzunu kullaniyor. RX init tamamen bitmeden
-  // TX init baslamaz; boylece havuz indeksi uzerinde yarismalari engellenir.
-  while(my_nrf_rx == NULL){
-    osDelay(1);
+  (void)argument;
+
+  /* F407'de tek NRF vardir. Fiziksel radyoyu RX taski yonetir; bu task
+     yalnizca gonderilecek payload'i radyo-sahibi taska teslim eder. */
+  while(!nrf_rx_init_completed || my_nrf_rx == NULL){
+    system_health_heartbeat(HEALTH_TASK_NRF_TX);
+    osDelay(100);
   }
-
-  nrf24l01_user_configs tx_cfg = {0};
-  tx_cfg.spi_handle = SPI3;
-  tx_cfg.dma_handle = DMA1;
-  tx_cfg.rx_stream = LL_DMA_STREAM_2;
-  tx_cfg.tx_stream = LL_DMA_STREAM_5;
-  tx_cfg.csn_port = nrf24_csn_pin_spi3_GPIO_Port;
-  tx_cfg.csn_pin = nrf24_csn_pin_spi3_Pin;
-  tx_cfg.ce_port = nrf24_ce_pin_spi3_GPIO_Port;
-  tx_cfg.ce_pin = nrf24_ce_pin_spi3_Pin;
-  tx_cfg.spi_semaphore = spi3_semaphoreHandle;
-
-  my_nrf_tx = nrf24l01_init(&tx_cfg);
-  if(my_nrf_tx == NULL) {
-    for(;;) { osDelay(1000); }
-  }
-
-  (void)spi_manager_register_validator(SPI3, validate_nrf24_spi, my_nrf_tx);
-
-  nrf24l01_assign_interrupt_task(my_nrf_tx, nrf24l01TXtaskHandle, 0x01);
+  my_nrf_tx = my_nrf_rx;
   nrf_tx_init_completed = true;
   nrf_tx_last_success_tick = osKernelGetTickCount();
-  osThreadFlagsClear(0x07);
 
-  static const uint8_t tx_iron_man[] = "enes";
-  static const uint8_t tx_captain_america[] = "erbulut";
-  static const uint8_t tx_hulk[] = "burada";
-
-  static const uint8_t* const tx_messages[] = {
-    tx_iron_man,
-    tx_captain_america,
-    tx_hulk
-  };
-
-  static const uint8_t tx_message_lengths[] = {
-    sizeof(tx_iron_man) - 1,
-    sizeof(tx_captain_america) - 1,
-    sizeof(tx_hulk) - 1
-  };
-
-  const uint8_t tx_message_count = sizeof(tx_messages) / sizeof(tx_messages[0]);
-  uint8_t tx_message_index = 0;
+  static const uint8_t tx_high[] = "HIGH";
+  static const uint8_t tx_low[] = "LOW";
+  uint32_t next_transmit_tick =
+          ((osKernelGetTickCount() / COMMUNICATION_PERIOD_MS) + 1) *
+          COMMUNICATION_PERIOD_MS;
 
   /* Infinite loop */
   for(;;)
   {
     system_health_heartbeat(HEALTH_TASK_NRF_TX);
-    const uint8_t* tx_message = tx_messages[tx_message_index];
-    uint8_t tx_message_length = tx_message_lengths[tx_message_index];
-
-    spi_job_t job;
-    nrf24l01_return_status nrf_status;
-    nrf_status = nrf24l01_build_tx_job(my_nrf_tx, tx_message, tx_message_length,
-                                      nrf24l01TXtaskHandle, 0x02, 0x04, &job);
-    if(nrf_status != _nrf24l01_ok)
-    {
-      flush_tx(my_nrf_tx);
-      nrf_tx_error_count++;
-      osDelay(1000);
-      continue;
+    osDelayUntil(next_transmit_tick);
+    next_transmit_tick += COMMUNICATION_PERIOD_MS;
+    uint32_t phase = (osKernelGetTickCount() / COMMUNICATION_PERIOD_MS) & 1;
+    const uint8_t* tx_message;
+    uint8_t tx_message_length;
+    /* F407 faz 0: CAN HIGH, NRF LOW. Faz 1: CAN LOW, NRF HIGH. */
+    if(phase == 0){
+      tx_message = tx_low;
+      tx_message_length = sizeof(tx_low) - 1;
+    }
+    else{
+      tx_message = tx_high;
+      tx_message_length = sizeof(tx_high) - 1;
     }
 
-    osStatus_t queue_status;
-    queue_status = submit_spi_dma_job(&job);
-    if(queue_status != osOK)
-    {
-      flush_tx(my_nrf_tx);
-      nrf_tx_error_count++;
-      osDelay(1000);
-      continue;
-    }
+    if(osMutexAcquire(nrf_mode_mutexHandle, 20) == osOK){
+      if(!nrf_tx_request_pending){
+        memcpy(nrf_pending_tx, tx_message, tx_message_length);
+        nrf_pending_tx_length = tx_message_length;
+        nrf_tx_request_pending = true;
+        osThreadFlagsSet(nrf24l01RXtaskHandle, NRF_RADIO_TX_REQUEST_FLAG);
 
-    uint32_t dma_flags = osThreadFlagsWait(0x06, osFlagsWaitAny, 500);
-    bool dma_wait_error = (dma_flags & osFlagsError) != 0;
-    bool dma_finished = (dma_flags & 0x02) != 0;
-    if(dma_wait_error || dma_finished == false)
-    {
-      flush_tx(my_nrf_tx);
-      nrf_tx_error_count++;
-      osDelay(1000);
-      continue;
-    }
-
-    osThreadFlagsClear(0x01);
-    nrf_status = nrf24l01_trigger_transmission(my_nrf_tx);
-    if(nrf_status != _nrf24l01_ok)
-    {
-      flush_tx(my_nrf_tx);
-      nrf_tx_error_count++;
-      osDelay(1000);
-      continue;
-    }
-
-    uint32_t irq_flags = osThreadFlagsWait(0x01, osFlagsWaitAny, 200);
-    bool irq_wait_error = (irq_flags & osFlagsError) != 0;
-    bool irq_arrived = (irq_flags & 0x01) != 0;
-    if(irq_wait_error || irq_arrived == false)
-    {
-      nrf24l01_clear_interrupts(my_nrf_tx);
-      flush_tx(my_nrf_tx);
-      nrf_tx_error_count++;
-      osDelay(1000);
-      continue;
-    }
-
-    nrf24l01_irq_status_t irq_status;
-    nrf_status = nrf24l01_get_irq_status(my_nrf_tx, &irq_status);
-    if(nrf_status != _nrf24l01_ok)
-    {
-      flush_tx(my_nrf_tx);
-      nrf_tx_error_count++;
-      osDelay(1000);
-      continue;
-    }
-
-    nrf24l01_clear_irq_sources(my_nrf_tx, irq_status.raw);
-    if(irq_status.tx_ds){
-      nrf_tx_success_count++;
-      nrf_tx_last_success_tick = osKernelGetTickCount();
-
-      osStatus_t mutex_status;
-      mutex_status = osMutexAcquire(sensor_data_mutexHandle, 10);
-      if(mutex_status == osOK){
-        copy_display_text(nrf24l01_display_data.tx_text,
-                sizeof(nrf24l01_display_data.tx_text), tx_message,
-                tx_message_length);
-        nrf24l01_display_data.tx_length = tx_message_length;
-        nrf24l01_display_data.tx_valid = true;
-        nrf24l01_display_data.tx_update_count++;
-        osMutexRelease(sensor_data_mutexHandle);
       }
-
-      tx_message_index++;
-      if(tx_message_index >= tx_message_count){
-        tx_message_index = 0;
-      }
-    }
-    else if(irq_status.max_rt){
-      flush_tx(my_nrf_tx);
-      nrf_tx_error_count++;
+      osMutexRelease(nrf_mode_mutexHandle);
     }
 
-    osDelay(1000);
   }
   /* USER CODE END startnrf24l01TXtask */
 }
@@ -2930,6 +3216,7 @@ void startnrf24l01TXtask(void *argument)
 void startnrf24l01RXtask(void *argument)
 {
   /* USER CODE BEGIN startnrf24l01RXtask */
+  (void)argument;
   nrf24l01_user_configs rx_cfg = {0};
   rx_cfg.spi_handle = SPI1;
   rx_cfg.dma_handle = DMA2;
@@ -2941,113 +3228,217 @@ void startnrf24l01RXtask(void *argument)
   rx_cfg.ce_pin = nrf24_ce_pin_spi1_Pin;
   rx_cfg.spi_semaphore = spi_semaphoreHandle;
 
-  my_nrf_rx = nrf24l01_init(&rx_cfg);
-  if(my_nrf_rx == NULL) {
-    for(;;) { osDelay(1000); }
+  while(my_nrf_rx == NULL){
+    system_health_heartbeat(HEALTH_TASK_NRF_RX);
+    my_nrf_rx = nrf24l01_init(&rx_cfg);
+    if(my_nrf_rx == NULL) osDelay(1000);
   }
 
   (void)spi_manager_register_validator(SPI1, validate_nrf24_spi, my_nrf_rx);
 
-  nrf24l01_assign_interrupt_task(my_nrf_rx, nrf24l01RXtaskHandle, 0x01);
-  osThreadFlagsClear(0x07);
+  my_nrf_tx = my_nrf_rx;
+  nrf24l01_assign_interrupt_task(my_nrf_rx, nrf24l01RXtaskHandle, NRF_RADIO_IRQ_FLAG);
+  osThreadFlagsClear(NRF_RADIO_IRQ_FLAG | NRF_RADIO_DMA_SUCCESS_FLAG |
+                     NRF_RADIO_DMA_ERROR_FLAG | NRF_RADIO_TX_REQUEST_FLAG);
   nrf24l01_clear_interrupts(my_nrf_rx);
   nrf24l01_start_listening(my_nrf_rx);
   nrf_rx_init_completed = true;
   nrf_rx_last_success_tick = osKernelGetTickCount();
+  uint32_t nrf_link_start_tick = osKernelGetTickCount();
+  uint32_t nrf_reinit_last_attempt_tick = 0;
 
   /* Infinite loop */
   for(;;)
   {
     system_health_heartbeat(HEALTH_TASK_NRF_RX);
-    uint32_t flags = osThreadFlagsWait(0x01, osFlagsWaitAny, 1000);
+    uint32_t now = osKernelGetTickCount();
+    uint32_t rx_reference_tick = g_communication_link_debug.nrf_rx_last_tick;
+    if(rx_reference_tick == 0) rx_reference_tick = nrf_link_start_tick;
+    g_communication_link_debug.nrf_rx_timeout =
+            (now - rx_reference_tick) >= COMMUNICATION_RX_TIMEOUT_MS;
+    if(g_communication_link_debug.nrf_rx_timeout){
+      /* Son alinan HIGH/LOW artik guncel degildir; kopuk hatta LED eski
+         durumunu koruyarak yaniltici bir baglanti goruntusu vermesin. */
+      LL_GPIO_ResetOutputPin(NRF_LINK_LED_GPIO_Port, NRF_LINK_LED_Pin);
+    }
+
+    if(g_communication_link_debug.nrf_rx_timeout &&
+       (now - nrf_reinit_last_attempt_tick) >= NRF_REINIT_RETRY_MS){
+      nrf_reinit_last_attempt_tick = now;
+      g_communication_link_debug.nrf_reinit_attempt_count++;
+      nrf24l01_return_status reinit_status =
+              nrf24l01_reinitialize(my_nrf_rx);
+      if(reinit_status == _nrf24l01_ok){
+        g_communication_link_debug.nrf_reinit_success_count++;
+      }
+      else{
+        g_communication_link_debug.nrf_reinit_failure_count++;
+      }
+    }
+
+    uint32_t flags = osThreadFlagsWait(NRF_RADIO_IRQ_FLAG | NRF_RADIO_TX_REQUEST_FLAG,
+                                       osFlagsWaitAny, 100);
     bool flag_wait_error = (flags & osFlagsError) != 0;
-    bool interrupt_arrived = (flags & 0x01) != 0;
-    if(flag_wait_error || interrupt_arrived == false) continue;
+    if(flag_wait_error) continue;
 
-    nrf24l01_irq_status_t irq_status = {0};
-    nrf24l01_return_status nrf_status;
-    nrf_status = nrf24l01_get_irq_status(my_nrf_rx, &irq_status);
-    if(nrf_status != _nrf24l01_ok) continue;
+    if((flags & NRF_RADIO_IRQ_FLAG) != 0){
+      nrf24l01_irq_status_t irq_status = {0};
+      nrf24l01_return_status nrf_status;
+      nrf_status = nrf24l01_get_irq_status(my_nrf_rx, &irq_status);
 
-    if(irq_status.rx_dr == false)
-    {
-      nrf24l01_clear_irq_sources(my_nrf_rx, irq_status.raw);
-      continue;
+      if(nrf_status == _nrf24l01_ok && irq_status.rx_dr){
+        uint8_t packets_read_this_interrupt = 0;
+        nrf24l01_fifo_status_t fifo_status;
+        nrf_status = nrf24l01_get_fifo_status(my_nrf_rx, &fifo_status);
+
+        if(nrf_status == _nrf24l01_ok){
+          nrf_rx_fifo_was_full = fifo_status.rx_full;
+
+          while(!fifo_status.rx_empty &&
+                packets_read_this_interrupt < NRF24L01_FIFO_DEPTH)
+          {
+            spi_job_t job;
+            uint8_t payload_length = 0;
+            nrf_status = nrf24l01_build_rx_fifo_job(my_nrf_rx,
+                        nrf24l01RXtaskHandle, NRF_RADIO_DMA_SUCCESS_FLAG,
+                        NRF_RADIO_DMA_ERROR_FLAG, &payload_length, &job);
+            if(nrf_status != _nrf24l01_ok) break;
+            if(submit_spi_dma_job(&job) != osOK) break;
+
+            uint32_t dma_flags = osThreadFlagsWait(
+                        NRF_RADIO_DMA_SUCCESS_FLAG | NRF_RADIO_DMA_ERROR_FLAG,
+                        osFlagsWaitAny, 500);
+            if((dma_flags & osFlagsError) != 0 ||
+               (dma_flags & NRF_RADIO_DMA_SUCCESS_FLAG) == 0) break;
+
+            uint8_t storage_index = nrf_rx_debug_write_index;
+            memset(nrf_rx_fifo[storage_index], 0, NRF24L01_PAYLOAD_SIZE);
+            nrf_status = nrf24l01_finish_rx_fifo_job(my_nrf_rx,
+                        nrf_rx_fifo[storage_index], payload_length);
+            if(nrf_status != _nrf24l01_ok) break;
+
+            nrf_rx_payload_lengths[storage_index] = payload_length;
+            if(osMutexAcquire(sensor_data_mutexHandle, 10) == osOK){
+              copy_display_text(nrf24l01_display_data.rx_text,
+                      sizeof(nrf24l01_display_data.rx_text),
+                      nrf_rx_fifo[storage_index], payload_length);
+              nrf24l01_display_data.rx_length = payload_length;
+              nrf24l01_display_data.rx_valid = true;
+              nrf24l01_display_data.rx_update_count++;
+              osMutexRelease(sensor_data_mutexHandle);
+            }
+
+            bool valid_level_message = false;
+            if(payload_length == 4 &&
+               memcmp(nrf_rx_fifo[storage_index], "HIGH", 4) == 0){
+              LL_GPIO_SetOutputPin(NRF_LINK_LED_GPIO_Port, NRF_LINK_LED_Pin);
+              valid_level_message = true;
+            }
+            else if(payload_length == 3 &&
+                    memcmp(nrf_rx_fifo[storage_index], "LOW", 3) == 0){
+              LL_GPIO_ResetOutputPin(NRF_LINK_LED_GPIO_Port, NRF_LINK_LED_Pin);
+              valid_level_message = true;
+            }
+            if(valid_level_message){
+              uint32_t receive_tick = osKernelGetTickCount();
+              g_communication_link_debug.nrf_rx_last_tick = receive_tick;
+              g_communication_link_debug.nrf_rx_timeout = false;
+            }
+
+            nrf_rx_debug_write_index++;
+            if(nrf_rx_debug_write_index >= NRF24L01_FIFO_DEPTH){
+              nrf_rx_debug_write_index = 0;
+            }
+            if(nrf_rx_fifo_count < NRF24L01_FIFO_DEPTH) nrf_rx_fifo_count++;
+
+            packets_read_this_interrupt++;
+            nrf_rx_packet_count++;
+            nrf_rx_last_success_tick = osKernelGetTickCount();
+            sayac++;
+
+            nrf24l01_clear_irq_sources(my_nrf_rx, NRF24L01_IRQ_RX_DR);
+            nrf_status = nrf24l01_get_fifo_status(my_nrf_rx, &fifo_status);
+            if(nrf_status != _nrf24l01_ok) break;
+          }
+
+          nrf_status = nrf24l01_get_fifo_status(my_nrf_rx, &fifo_status);
+          if(nrf_status == _nrf24l01_ok && !fifo_status.rx_empty){
+            osThreadFlagsSet(nrf24l01RXtaskHandle, NRF_RADIO_IRQ_FLAG);
+          }
+        }
+      }
+      else if(nrf_status == _nrf24l01_ok){
+        nrf24l01_clear_irq_sources(my_nrf_rx, irq_status.raw);
+      }
     }
 
-    uint8_t packets_read_this_interrupt = 0;
-    nrf24l01_fifo_status_t fifo_status;
-    nrf_status = nrf24l01_get_fifo_status(my_nrf_rx, &fifo_status);
-    if(nrf_status != _nrf24l01_ok) continue;
+    if((flags & NRF_RADIO_TX_REQUEST_FLAG) != 0){
+      uint8_t tx_payload[NRF24L01_PAYLOAD_SIZE] = {0};
+      uint8_t tx_length = 0;
 
-    // nRF24L01 ayri bir FIFO-full interrupt'i uretmez.
-    // RX_DR geldikten sonra RX_FULL biti, FIFO'nun 3 paket dolu oldugunu gosterir.
-    nrf_rx_fifo_was_full = fifo_status.rx_full;
-
-    // FIFO doluysa 3 paket; dolu degilse o anda bulunan 1 veya 2 paket okunur.
-    while(fifo_status.rx_empty == false &&
-          packets_read_this_interrupt < NRF24L01_FIFO_DEPTH)
-    {
-      spi_job_t job;
-      uint8_t payload_length = 0;
-      nrf_status = nrf24l01_build_rx_fifo_job(my_nrf_rx, nrf24l01RXtaskHandle,
-                                              0x02, 0x04, &payload_length, &job);
-      if(nrf_status != _nrf24l01_ok) break;
-
-      osStatus_t queue_status;
-      queue_status = submit_spi_dma_job(&job);
-      if(queue_status != osOK) break;
-
-      uint32_t dma_flags = osThreadFlagsWait(0x06, osFlagsWaitAny, 500);
-      bool dma_wait_error = (dma_flags & osFlagsError) != 0;
-      bool dma_finished = (dma_flags & 0x02) != 0;
-      if(dma_wait_error || dma_finished == false) break;
-
-      uint8_t storage_index = nrf_rx_debug_write_index;
-      memset(nrf_rx_fifo[storage_index], 0, NRF24L01_PAYLOAD_SIZE);
-      nrf_status = nrf24l01_finish_rx_fifo_job(my_nrf_rx,
-                                               nrf_rx_fifo[storage_index],
-                                               payload_length);
-      if(nrf_status != _nrf24l01_ok) break;
-
-      nrf_rx_payload_lengths[storage_index] = payload_length;
-
-      osStatus_t mutex_status;
-      mutex_status = osMutexAcquire(sensor_data_mutexHandle, 10);
-      if(mutex_status == osOK){
-        copy_display_text(nrf24l01_display_data.rx_text,
-                sizeof(nrf24l01_display_data.rx_text),
-                nrf_rx_fifo[storage_index], payload_length);
-        nrf24l01_display_data.rx_length = payload_length;
-        nrf24l01_display_data.rx_valid = true;
-        nrf24l01_display_data.rx_update_count++;
-        osMutexRelease(sensor_data_mutexHandle);
+      if(osMutexAcquire(nrf_mode_mutexHandle, 20) == osOK){
+        if(nrf_tx_request_pending){
+          tx_length = nrf_pending_tx_length;
+          memcpy(tx_payload, nrf_pending_tx, tx_length);
+          nrf_tx_request_pending = false;
+        }
+        osMutexRelease(nrf_mode_mutexHandle);
       }
 
-      nrf_rx_debug_write_index++;
-      if(nrf_rx_debug_write_index >= NRF24L01_FIFO_DEPTH){
-        nrf_rx_debug_write_index = 0;
+      if(tx_length > 0){
+        bool tx_success = false;
+        spi_job_t job;
+        nrf24l01_return_status nrf_status;
+
+        nrf24l01_stop_listening(my_nrf_rx);
+        nrf_status = nrf24l01_build_tx_job(my_nrf_rx, tx_payload, tx_length,
+                    nrf24l01RXtaskHandle, NRF_RADIO_DMA_SUCCESS_FLAG,
+                    NRF_RADIO_DMA_ERROR_FLAG, &job);
+
+        if(nrf_status == _nrf24l01_ok && submit_spi_dma_job(&job) == osOK){
+          uint32_t dma_flags = osThreadFlagsWait(
+                      NRF_RADIO_DMA_SUCCESS_FLAG | NRF_RADIO_DMA_ERROR_FLAG,
+                      osFlagsWaitAny, 500);
+
+          if((dma_flags & osFlagsError) == 0 &&
+             (dma_flags & NRF_RADIO_DMA_SUCCESS_FLAG) != 0 &&
+             nrf24l01_trigger_transmission(my_nrf_rx) == _nrf24l01_ok){
+            uint32_t irq_flags = osThreadFlagsWait(NRF_RADIO_IRQ_FLAG,
+                                                   osFlagsWaitAny, 200);
+            if((irq_flags & osFlagsError) == 0 &&
+               (irq_flags & NRF_RADIO_IRQ_FLAG) != 0){
+              nrf24l01_irq_status_t irq_status = {0};
+              if(nrf24l01_get_irq_status(my_nrf_rx, &irq_status) ==
+                 _nrf24l01_ok){
+                nrf24l01_clear_irq_sources(my_nrf_rx, irq_status.raw);
+                tx_success = irq_status.tx_ds;
+                if(irq_status.max_rt) flush_tx(my_nrf_rx);
+              }
+            }
+          }
+        }
+
+        if(tx_success){
+          nrf_tx_success_count++;
+          nrf_tx_last_success_tick = osKernelGetTickCount();
+          if(osMutexAcquire(sensor_data_mutexHandle, 10) == osOK){
+            copy_display_text(nrf24l01_display_data.tx_text,
+                    sizeof(nrf24l01_display_data.tx_text),
+                    tx_payload, tx_length);
+            nrf24l01_display_data.tx_length = tx_length;
+            nrf24l01_display_data.tx_valid = true;
+            nrf24l01_display_data.tx_update_count++;
+            osMutexRelease(sensor_data_mutexHandle);
+          }
+        }
+        else{
+          flush_tx(my_nrf_rx);
+          nrf24l01_clear_interrupts(my_nrf_rx);
+          nrf_tx_error_count++;
+        }
+
+        nrf24l01_start_listening(my_nrf_rx);
       }
-
-      if(nrf_rx_fifo_count < NRF24L01_FIFO_DEPTH){
-        nrf_rx_fifo_count++;
-      }
-
-      packets_read_this_interrupt++;
-      nrf_rx_packet_count++;
-      nrf_rx_last_success_tick = osKernelGetTickCount();
-      sayac++;
-
-      // Datasheet sirasi: payload oku, RX_DR temizle, FIFO_STATUS kontrol et.
-      nrf24l01_clear_irq_sources(my_nrf_rx, NRF24L01_IRQ_RX_DR);
-      nrf_status = nrf24l01_get_fifo_status(my_nrf_rx, &fifo_status);
-      if(nrf_status != _nrf24l01_ok) break;
-    }
-
-    // Okuma sirasinda yeni paket geldiyse kalan FIFO'yu sonraki turda bosalt.
-    nrf_status = nrf24l01_get_fifo_status(my_nrf_rx, &fifo_status);
-    if(nrf_status == _nrf24l01_ok && fifo_status.rx_empty == false){
-      osThreadFlagsSet(nrf24l01RXtaskHandle, 0x01);
     }
   }
   /* USER CODE END startnrf24l01RXtask */
@@ -3063,11 +3454,6 @@ void startnrf24l01RXtask(void *argument)
 void startili9341task(void *argument)
 {
   /* USER CODE BEGIN startili9341task */
-  while(bme280_init_completed == false ||
-        mpu6050_init_completed == false){
-    osDelay(10);
-  }
-
   ili9341_user_configs tft1_cfg = {0};
   tft1_cfg.spi_handle = SPI3;
   tft1_cfg.dma_handle = DMA1;
@@ -3079,7 +3465,7 @@ void startili9341task(void *argument)
   tft1_cfg.dc_pin = TFT1_DC_Pin;
   tft1_cfg.rst_port = TFT1_RST_GPIO_Port;
   tft1_cfg.rst_pin = TFT1_RST_Pin;
-  tft1_cfg.rotation = ILI9341_ROTATION_90;
+  tft1_cfg.rotation = ILI9341_ROTATION_270;
 
   ili9341_user_configs tft2_cfg = {0};
   tft2_cfg.spi_handle = SPI3;
@@ -3092,15 +3478,15 @@ void startili9341task(void *argument)
   tft2_cfg.dc_pin = TFT2_DC_Pin;
   tft2_cfg.rst_port = TFT2_RST_GPIO_Port;
   tft2_cfg.rst_pin = TFT2_RST_Pin;
-  tft2_cfg.rotation = ILI9341_ROTATION_90;
+  tft2_cfg.rotation = ILI9341_ROTATION_270;
 
-  my_tft1 = ili9341_init(&tft1_cfg);
-  my_tft2 = ili9341_init(&tft2_cfg);
-
-  if(my_tft1 == NULL || my_tft2 == NULL){
-    ili9341_last_status = _ili9341_fail;
-    ili9341_test_passed = false;
-    for(;;){
+  while(my_tft1 == NULL || my_tft2 == NULL){
+    system_health_heartbeat(HEALTH_TASK_DISPLAY);
+    if(my_tft1 == NULL) my_tft1 = ili9341_init(&tft1_cfg);
+    if(my_tft2 == NULL) my_tft2 = ili9341_init(&tft2_cfg);
+    if(my_tft1 == NULL || my_tft2 == NULL){
+      ili9341_last_status = _ili9341_fail;
+      ili9341_test_passed = false;
       osDelay(1000);
     }
   }
@@ -3129,9 +3515,8 @@ void startili9341task(void *argument)
 
   ili9341_test_passed = ili9341_last_status == _ili9341_ok;
   uint32_t last_bme280_update_count = 0;
-  uint32_t last_mpu6050_update_count = 0;
-  uint32_t last_nrf_tx_update_count = 0;
-  uint32_t last_nrf_rx_update_count = 0;
+  uint32_t last_mpu6500_update_count = 0;
+  uint32_t last_adxl345_update_count = 0;
   uint32_t last_rc522_update_count = 0;
   uint32_t next_sensor_display_tick = osKernelGetTickCount();
 
@@ -3144,15 +3529,15 @@ void startili9341task(void *argument)
     osDelay(10);
 
     bme280_display_data_t bme_snapshot = {0};
-    mpu6050_display_data_t mpu_snapshot = {0};
-    nrf24l01_display_data_t nrf_snapshot = {0};
+    mpu6500_display_data_t mpu_snapshot = {0};
+    adxl345_display_data_t adxl_snapshot = {0};
     rc522_display_data_t rc522_snapshot = {0};
     osStatus_t mutex_status;
     mutex_status = osMutexAcquire(sensor_data_mutexHandle, 20);
     if(mutex_status == osOK){
       bme_snapshot = bme280_display_data;
-      mpu_snapshot = mpu6050_display_data;
-      nrf_snapshot = nrf24l01_display_data;
+      mpu_snapshot = mpu6500_display_data;
+      adxl_snapshot = adxl345_display_data;
       rc522_snapshot = rc522_display_data;
       osMutexRelease(sensor_data_mutexHandle);
     }
@@ -3176,35 +3561,23 @@ void startili9341task(void *argument)
     }
 
     if(sensor_refresh_due && mpu_snapshot.valid &&
-       mpu_snapshot.update_count != last_mpu6050_update_count){
+       mpu_snapshot.update_count != last_mpu6500_update_count){
       ili9341_return_status display_status;
-      display_status = refresh_mpu6050_display(&mpu_snapshot);
+      display_status = refresh_mpu6500_display(&mpu_snapshot);
       if(display_status == _ili9341_ok){
-        last_mpu6050_update_count = mpu_snapshot.update_count;
+        last_mpu6500_update_count = mpu_snapshot.update_count;
       }
       else{
         ili9341_last_status = display_status;
       }
     }
 
-    if(nrf_snapshot.tx_valid &&
-       nrf_snapshot.tx_update_count != last_nrf_tx_update_count){
+    if(sensor_refresh_due && adxl_snapshot.valid &&
+       adxl_snapshot.update_count != last_adxl345_update_count){
       ili9341_return_status display_status;
-      display_status = refresh_nrf_tx_display(&nrf_snapshot);
+      display_status = refresh_adxl345_display(&adxl_snapshot);
       if(display_status == _ili9341_ok){
-        last_nrf_tx_update_count = nrf_snapshot.tx_update_count;
-      }
-      else{
-        ili9341_last_status = display_status;
-      }
-    }
-
-    if(nrf_snapshot.rx_valid &&
-       nrf_snapshot.rx_update_count != last_nrf_rx_update_count){
-      ili9341_return_status display_status;
-      display_status = refresh_nrf_rx_display(&nrf_snapshot);
-      if(display_status == _ili9341_ok){
-        last_nrf_rx_update_count = nrf_snapshot.rx_update_count;
+        last_adxl345_update_count = adxl_snapshot.update_count;
       }
       else{
         ili9341_last_status = display_status;
@@ -3227,11 +3600,315 @@ void startili9341task(void *argument)
   /* USER CODE END startili9341task */
 }
 
+/* USER CODE BEGIN Header_startadxl345task */
+/* Periodic ADXL345 I2C2 RX-DMA task. */
+/* USER CODE END Header_startadxl345task */
+void startadxl345task(void *argument)
+{
+  /* USER CODE BEGIN startadxl345task */
+  (void)argument;
+  uint32_t ready = osThreadFlagsWait(I2C_WORKER_READY_FLAG,
+          osFlagsWaitAny, osWaitForever);
+  if((ready & I2C_WORKER_READY_FLAG) == 0) for(;;) osDelay(1000);
+
+  adxl345_config_t config = {
+    .i2c_handle = I2C2,
+    .dma_handle = DMA1,
+    .dma_stream = LL_DMA_STREAM_3,
+    .i2c_address = ADXL345_I2C_ADDRESS_ALT_LOW
+  };
+  while(my_adxl345 == NULL){
+    system_health_heartbeat(HEALTH_TASK_ADXL345);
+    if(acquire_i2c_init_lock()){
+      config.i2c_address = ADXL345_I2C_ADDRESS_ALT_LOW;
+      my_adxl345 = adxl345_init(&config);
+      if(my_adxl345 == NULL){
+        config.i2c_address = ADXL345_I2C_ADDRESS_ALT_HIGH;
+        my_adxl345 = adxl345_init(&config);
+      }
+      release_i2c_init_lock();
+    }
+    if(my_adxl345 == NULL) osDelay(1000);
+  }
+  adxl345_init_completed = true;
+  adxl345_last_success_tick = osKernelGetTickCount();
+  register_i2c_sensor_client_ready(I2C2);
+
+  /* I2C2 dispatcher zaten ayni hattaki islemleri siralastirir. Bir sensorun
+   * init hatasi, basariyla init edilen diger sensoru ortak bariyerde
+   * sonsuza kadar bekletmemelidir. */
+
+  uint32_t next_wake = osKernelGetTickCount();
+  for(;;){
+    system_health_heartbeat(HEALTH_TASK_ADXL345);
+    next_wake += 100;
+    osThreadFlagsClear(ADXL345_DMA_SUCCESS_FLAG | ADXL345_DMA_ERROR_FLAG);
+    i2c_job_t job;
+    if(adxl345_build_read_job(my_adxl345, adxl345taskHandle,
+            ADXL345_DMA_SUCCESS_FLAG, ADXL345_DMA_ERROR_FLAG,
+            &job) != ADXL345_OK || submit_i2c_dma_job(&job) != osOK){
+      adxl345_dma_error_count++;
+      osDelayUntil(next_wake);
+      continue;
+    }
+    uint32_t flags = osThreadFlagsWait(ADXL345_DMA_SUCCESS_FLAG |
+            ADXL345_DMA_ERROR_FLAG, osFlagsWaitAny, 1000);
+    if((flags & osFlagsError) != 0 ||
+            (flags & ADXL345_DMA_SUCCESS_FLAG) == 0){
+      adxl345_dma_error_count++;
+      system_health_bus_record_failure(SYSTEM_BUS_I2C2,
+              _i2c_manager_dma_error);
+    }
+    else{
+      adxl345_data_t sample;
+      if(adxl345_process_data(my_adxl345, &sample) == ADXL345_OK){
+        if(osMutexAcquire(sensor_data_mutexHandle, 20) == osOK){
+          adxl345_display_data.x_g = sample.x_g;
+          adxl345_display_data.y_g = sample.y_g;
+          adxl345_display_data.z_g = sample.z_g;
+          adxl345_display_data.valid = true;
+          adxl345_display_data.update_count++;
+          osMutexRelease(sensor_data_mutexHandle);
+        }
+        adxl345_dma_success_count++;
+        adxl345_last_success_tick = osKernelGetTickCount();
+        system_health_bus_record_success(SYSTEM_BUS_I2C2,
+                SYSTEM_SOURCE_ADXL345, SYSTEM_OPERATION_READ,
+                config.i2c_address, 0x32);
+      }
+    }
+    osDelayUntil(next_wake);
+  }
+  /* USER CODE END startadxl345task */
+}
+
+/* USER CODE BEGIN Header_startvl53l0xtask */
+/* Periodic VL53L0X I2C2 ranging task. Result block is read with RX-DMA. */
+/* USER CODE END Header_startvl53l0xtask */
+void startvl53l0xtask(void *argument)
+{
+  /* USER CODE BEGIN startvl53l0xtask */
+  (void)argument;
+  uint32_t ready = osThreadFlagsWait(I2C_WORKER_READY_FLAG,
+          osFlagsWaitAny, osWaitForever);
+  if((ready & I2C_WORKER_READY_FLAG) == 0) for(;;) osDelay(1000);
+
+  vl53l0x_config_t config = {
+    .i2c_handle = I2C2,
+    .dma_handle = DMA1,
+    .dma_stream = LL_DMA_STREAM_3,
+    .i2c_address = VL53L0X_I2C_ADDRESS
+  };
+
+  /* Sensor ilk acilista NACK verirse task'i kalici olarak oldurmek yerine
+   * kontrollu araliklarla yeniden dene. Bu sirada ADXL345 calismaya devam
+   * eder ve Live Expressions son NACK fazini gosterebilir. */
+  while(my_vl53l0x == NULL){
+    system_health_heartbeat(HEALTH_TASK_VL53L0X);
+    if(!acquire_i2c_init_lock()){
+      osDelay(1000);
+      continue;
+    }
+    my_vl53l0x = vl53l0x_init(&config);
+    release_i2c_init_lock();
+    if(my_vl53l0x == NULL) osDelay(1000);
+  }
+  vl53l0x_init_completed = true;
+  vl53l0x_last_success_tick = osKernelGetTickCount();
+  register_i2c_sensor_client_ready(I2C2);
+
+  uint32_t next_poll_tick = osKernelGetTickCount();
+  for(;;){
+    system_health_heartbeat(HEALTH_TASK_VL53L0X);
+    next_poll_tick += 50;
+
+    bool measurement_ready = false;
+    vl53l0x_status_t sensor_status = vl53l0x_is_data_ready(
+            my_vl53l0x, &measurement_ready);
+    if(sensor_status != VL53L0X_OK){
+      vl53l0x_dma_error_count++;
+      vl53l0x_display_data.error_count++;
+      system_health_bus_record_failure(SYSTEM_BUS_I2C2,
+              (int32_t)sensor_status);
+      osDelayUntil(next_poll_tick);
+      continue;
+    }
+    if(!measurement_ready){
+      osDelayUntil(next_poll_tick);
+      continue;
+    }
+
+    osThreadFlagsClear(VL53L0X_DMA_SUCCESS_FLAG | VL53L0X_DMA_ERROR_FLAG);
+    i2c_job_t job;
+    if(vl53l0x_build_read_job(my_vl53l0x, vl53l0xtaskHandle,
+            VL53L0X_DMA_SUCCESS_FLAG, VL53L0X_DMA_ERROR_FLAG, &job) !=
+            VL53L0X_OK || submit_i2c_dma_job(&job) != osOK){
+      vl53l0x_dma_error_count++;
+      vl53l0x_display_data.error_count++;
+      osDelayUntil(next_poll_tick);
+      continue;
+    }
+
+    uint32_t flags = osThreadFlagsWait(VL53L0X_DMA_SUCCESS_FLAG |
+            VL53L0X_DMA_ERROR_FLAG, osFlagsWaitAny, 1000);
+    if((flags & osFlagsError) != 0 ||
+       (flags & VL53L0X_DMA_SUCCESS_FLAG) == 0){
+      vl53l0x_dma_error_count++;
+      vl53l0x_display_data.error_count++;
+      system_health_bus_record_failure(SYSTEM_BUS_I2C2,
+              _i2c_manager_dma_error);
+      osDelayUntil(next_poll_tick);
+      continue;
+    }
+
+    vl53l0x_measurement_t measurement = {0};
+    sensor_status = vl53l0x_process_data(my_vl53l0x, &measurement);
+    if(sensor_status == VL53L0X_OK &&
+       vl53l0x_clear_interrupt(my_vl53l0x) == VL53L0X_OK){
+      uint32_t now = osKernelGetTickCount();
+      vl53l0x_display_data.distance_mm = measurement.distance_mm;
+      vl53l0x_display_data.range_status = measurement.range_status;
+      vl53l0x_display_data.valid = measurement.valid;
+      vl53l0x_display_data.update_count++;
+      vl53l0x_display_data.last_success_tick = now;
+      vl53l0x_dma_success_count++;
+      vl53l0x_last_success_tick = now;
+      system_health_bus_record_success(SYSTEM_BUS_I2C2,
+              SYSTEM_SOURCE_VL53L0X, SYSTEM_OPERATION_READ,
+              config.i2c_address, measurement.distance_mm);
+    }else{
+      vl53l0x_dma_error_count++;
+      vl53l0x_display_data.error_count++;
+      system_health_bus_record_failure(SYSTEM_BUS_I2C2,
+              (int32_t)sensor_status);
+    }
+    osDelayUntil(next_poll_tick);
+  }
+  /* USER CODE END startvl53l0xtask */
+}
+
+/* USER CODE BEGIN Header_startssd1306spitask */
+/* SPI3 SSD1306 framebuffer DMA task. */
+/* USER CODE END Header_startssd1306spitask */
+void startssd1306spitask(void *argument)
+{
+  /* USER CODE BEGIN startssd1306spitask */
+  (void)argument;
+  while(!spi_dispatch_ready) osDelay(10);
+  ssd1306_spi_config_t config = {
+    .spi_handle = SPI3, .dma_handle = DMA1,
+    .rx_stream = LL_DMA_STREAM_2, .tx_stream = LL_DMA_STREAM_5,
+    .cs_port = SSD1306_SPI_CS_GPIO_Port, .cs_pin = SSD1306_SPI_CS_Pin,
+    .dc_port = SSD1306_SPI_DC_GPIO_Port, .dc_pin = SSD1306_SPI_DC_Pin,
+    .reset_port = SSD1306_SPI_RST_GPIO_Port, .reset_pin = SSD1306_SPI_RST_Pin
+  };
+  while(my_ssd1306_spi == NULL){
+    system_health_heartbeat(HEALTH_TASK_SSD1306_SPI);
+    my_ssd1306_spi = ssd1306_spi_init(&config);
+    if(my_ssd1306_spi == NULL) osDelay(1000);
+  }
+  ssd1306_spi_init_completed = true;
+  ssd1306_spi_last_success_tick = osKernelGetTickCount();
+
+  uint32_t last_nrf_tx_count = UINT32_MAX;
+  uint32_t last_nrf_rx_count = UINT32_MAX;
+  uint32_t last_can_tx_count = UINT32_MAX;
+  uint32_t last_can_rx_count = UINT32_MAX;
+  bool last_can_timeout = false;
+  bool last_nrf_timeout = false;
+  for(;;){
+    system_health_heartbeat(HEALTH_TASK_SSD1306_SPI);
+    nrf24l01_display_data_t nrf = {0};
+    can_display_data_t can = {0};
+    if(osMutexAcquire(sensor_data_mutexHandle, 20) == osOK){
+      nrf = nrf24l01_display_data;
+      can = can_display_data;
+      osMutexRelease(sensor_data_mutexHandle);
+    }
+    uint32_t can_tx_count = can.tx_update_count;
+    uint32_t can_rx_count = can.rx_update_count;
+    bool can_timeout = g_communication_link_debug.can_rx_timeout;
+    bool nrf_timeout = g_communication_link_debug.nrf_rx_timeout;
+    if(nrf.tx_update_count != last_nrf_tx_count ||
+       nrf.rx_update_count != last_nrf_rx_count ||
+       can_tx_count != last_can_tx_count || can_rx_count != last_can_rx_count ||
+       can_timeout != last_can_timeout || nrf_timeout != last_nrf_timeout){
+      char line[22];
+      const char* can_tx_text = "WAIT";
+      const char* can_rx_text = "WAIT";
+      const char* nrf_tx_text = "WAIT";
+      const char* nrf_rx_text = "WAIT";
+      if(can_timeout){
+        /* TX isteginin mailbox'a alinmasi, fiziksel hattan ACK geldigi
+           anlamina gelmez. RX akisi kesildiyse iki CAN satiri da offline. */
+        can_tx_text = "VERI GELMEDI";
+        can_rx_text = "VERI GELMEDI";
+      }
+      else{
+        if(can.tx_update_count != 0) can_tx_text = can.tx_text;
+        if(can.rx_update_count != 0) can_rx_text = can.rx_text;
+      }
+      if(nrf_timeout){
+        /* Kopukken son basarili TX metnini gostermek de eski veri olur. */
+        nrf_tx_text = "VERI GELMEDI";
+        nrf_rx_text = "VERI GELMEDI";
+      }
+      else{
+        if(nrf.tx_valid) nrf_tx_text = nrf.tx_text;
+        if(nrf.rx_valid) nrf_rx_text = nrf.rx_text;
+      }
+      ssd1306_spi_clear(my_ssd1306_spi);
+      snprintf(line, sizeof(line), "CAN>%.12s",
+              can_tx_text);
+      ssd1306_spi_draw_text(my_ssd1306_spi, 0, 0, line);
+      snprintf(line, sizeof(line), "CAN<%.12s",
+              can_rx_text);
+      ssd1306_spi_draw_text(my_ssd1306_spi, 0, 4, line);
+
+      snprintf(line, sizeof(line), "NRF>%.12s",
+              nrf_tx_text);
+      ssd1306_spi_draw_text(my_ssd1306_spi, 0, 8, line);
+      snprintf(line, sizeof(line), "NRF<%.12s",
+              nrf_rx_text);
+      ssd1306_spi_draw_text(my_ssd1306_spi, 0, 12, line);
+
+      osThreadFlagsClear(SSD1306_SPI_SUCCESS_FLAG | SSD1306_SPI_ERROR_FLAG);
+      spi_job_t job;
+      if(ssd1306_spi_build_refresh_job(my_ssd1306_spi,
+              ssd1306spitaskHandle, SSD1306_SPI_SUCCESS_FLAG,
+              SSD1306_SPI_ERROR_FLAG, &job) &&
+              submit_spi_dma_job(&job) == osOK){
+        uint32_t flags = osThreadFlagsWait(SSD1306_SPI_SUCCESS_FLAG |
+                SSD1306_SPI_ERROR_FLAG, osFlagsWaitAny, 1500);
+        if((flags & osFlagsError) == 0 &&
+                (flags & SSD1306_SPI_SUCCESS_FLAG) != 0){
+          ssd1306_spi_refresh_count++;
+          ssd1306_spi_last_success_tick = osKernelGetTickCount();
+          last_nrf_tx_count = nrf.tx_update_count;
+          last_nrf_rx_count = nrf.rx_update_count;
+          last_can_tx_count = can_tx_count;
+          last_can_rx_count = can_rx_count;
+          last_can_timeout = can_timeout;
+          last_nrf_timeout = nrf_timeout;
+          system_health_bus_record_success(SYSTEM_BUS_SPI3,
+                  SYSTEM_SOURCE_SSD1306_SPI, SYSTEM_OPERATION_WRITE,
+                  0, SSD1306_BUFFER_SIZE);
+        }
+      }
+    }
+    osDelay(100);
+  }
+  /* USER CODE END startssd1306spitask */
+}
+
 static bool recover_supervised_bus(system_health_bus_id_t bus){
   if(bus == SYSTEM_BUS_I2C1){
     /* Aktif DMA/polling transferini health tasktan zorla bozma. Manager mutexi
      * recovery ile dispatcher'i siraya sokar; mesgulse sonraki turda denenir. */
     return i2c_manager_recover_bus(I2C1) == _i2c_manager_ok;
+  }
+  if(bus == SYSTEM_BUS_I2C2){
+    return i2c_manager_recover_bus(I2C2) == _i2c_manager_ok;
   }
   if(bus == SYSTEM_BUS_SPI1){
     return spi_manager_recover_bus(SPI1) == _spi_manager_ok;
@@ -3297,12 +3974,16 @@ void starthealthtask(void *argument)
   uint32_t observed_bme_tick = 0;
   uint32_t observed_mpu_tick = 0;
   uint32_t observed_rc522_tick = 0;
+#if WATCHDOG_MONITOR_NRF
   uint32_t observed_nrf_tx_tick = 0;
   uint32_t observed_nrf_rx_tick = 0;
+#endif
   uint32_t observed_display_tick = 0;
+#if CAN2_RUNTIME_ENABLED && WATCHDOG_MONITOR_CAN
   uint32_t observed_can_tx_count = 0;
   uint32_t observed_can_rx_count = 0;
   uint32_t observed_can_error_count = 0;
+#endif
 
   for(;;)
   {
@@ -3318,35 +3999,38 @@ void starthealthtask(void *argument)
       system_health_bus_record_success(SYSTEM_BUS_I2C1,
               SYSTEM_SOURCE_BME280, SYSTEM_OPERATION_READ, 0x76, 0);
     }
-    if(mpu6050_last_success_tick != observed_mpu_tick){
-      observed_mpu_tick = mpu6050_last_success_tick;
+    if(mpu6500_last_success_tick != observed_mpu_tick){
+      observed_mpu_tick = mpu6500_last_success_tick;
       system_health_bus_record_success(SYSTEM_BUS_I2C1,
               SYSTEM_SOURCE_MPU6500, SYSTEM_OPERATION_READ, 0x68, 0);
     }
-    if(!REDUCED_I2C_CAN_TEST &&
+    if(!I2C_ONLY_TEST &&
        rc522_last_liveness_tick != observed_rc522_tick){
       observed_rc522_tick = rc522_last_liveness_tick;
       system_health_bus_record_success(SYSTEM_BUS_SPI1,
               SYSTEM_SOURCE_RC522, SYSTEM_OPERATION_TRANSFER, 0, 0);
     }
-    if(!REDUCED_I2C_CAN_TEST &&
+#if WATCHDOG_MONITOR_NRF
+    if(!I2C_ONLY_TEST &&
        nrf_tx_last_success_tick != observed_nrf_tx_tick){
       observed_nrf_tx_tick = nrf_tx_last_success_tick;
-      system_health_bus_record_success(SYSTEM_BUS_SPI3,
+      system_health_bus_record_success(SYSTEM_BUS_SPI1,
               SYSTEM_SOURCE_NRF24_TX, SYSTEM_OPERATION_WRITE, 0, 0);
     }
-    if(!REDUCED_I2C_CAN_TEST &&
+    if(!I2C_ONLY_TEST &&
        nrf_rx_last_success_tick != observed_nrf_rx_tick){
       observed_nrf_rx_tick = nrf_rx_last_success_tick;
       system_health_bus_record_success(SYSTEM_BUS_SPI1,
               SYSTEM_SOURCE_NRF24_RX, SYSTEM_OPERATION_READ, 0, 0);
     }
-    if(!REDUCED_I2C_CAN_TEST &&
+#endif
+    if(!I2C_ONLY_TEST &&
        ili9341_last_success_tick != observed_display_tick){
       observed_display_tick = ili9341_last_success_tick;
       system_health_bus_record_success(SYSTEM_BUS_SPI3,
               SYSTEM_SOURCE_ILI9341, SYSTEM_OPERATION_WRITE, 0, 0);
     }
+#if CAN2_RUNTIME_ENABLED && WATCHDOG_MONITOR_CAN
     if(g_can2_debug.tx_complete_count != observed_can_tx_count){
       observed_can_tx_count = g_can2_debug.tx_complete_count;
       system_health_bus_record_success(SYSTEM_BUS_CAN2,
@@ -3371,33 +4055,49 @@ void starthealthtask(void *argument)
       system_health_bus_record_failure(SYSTEM_BUS_CAN2,
               (int32_t)g_can2_debug.last_status);
     }
+#endif
 
     uint32_t stale_mask = 0;
     if(bme280_init_completed &&
        (now - bme280_last_success_tick) >= SENSOR_DATA_STALE_TIMEOUT_MS){
       stale_mask |= SENSOR_STALE_BME280_MASK;
     }
-    if(mpu6050_init_completed &&
-       (now - mpu6050_last_success_tick) >= SENSOR_DATA_STALE_TIMEOUT_MS){
-      stale_mask |= SENSOR_STALE_MPU6050_MASK;
+    if(mpu6500_init_completed &&
+       (now - mpu6500_last_success_tick) >= SENSOR_DATA_STALE_TIMEOUT_MS){
+      stale_mask |= SENSOR_STALE_MPU6500_MASK;
     }
-    if(!REDUCED_I2C_CAN_TEST && rc522_init_completed &&
+    if(!I2C_ONLY_TEST && rc522_init_completed &&
        (now - rc522_last_liveness_tick) >=
                RC522_LIVENESS_STALE_TIMEOUT_MS){
       stale_mask |= SPI_STALE_RC522_MASK;
     }
-    if(!REDUCED_I2C_CAN_TEST && nrf_tx_init_completed &&
+#if WATCHDOG_MONITOR_NRF
+    if(!I2C_ONLY_TEST && nrf_tx_init_completed &&
        (now - nrf_tx_last_success_tick) >= NRF_PROGRESS_STALE_TIMEOUT_MS){
       stale_mask |= SPI_STALE_NRF_TX_MASK;
     }
-    if(!REDUCED_I2C_CAN_TEST && nrf_rx_init_completed &&
+    if(!I2C_ONLY_TEST && nrf_rx_init_completed &&
        (now - nrf_rx_last_success_tick) >= NRF_PROGRESS_STALE_TIMEOUT_MS){
       stale_mask |= SPI_STALE_NRF_RX_MASK;
     }
-    if(!REDUCED_I2C_CAN_TEST && ili9341_init_completed &&
+#endif
+    if(!I2C_ONLY_TEST && ili9341_init_completed &&
        (now - ili9341_last_success_tick) >=
                DISPLAY_PROGRESS_STALE_TIMEOUT_MS){
       stale_mask |= SPI_STALE_DISPLAY_MASK;
+    }
+    if(adxl345_init_completed &&
+       (now - adxl345_last_success_tick) >= SENSOR_DATA_STALE_TIMEOUT_MS){
+      stale_mask |= SENSOR_STALE_ADXL345_MASK;
+    }
+    if(vl53l0x_init_completed &&
+       (now - vl53l0x_last_success_tick) >= SENSOR_DATA_STALE_TIMEOUT_MS){
+      stale_mask |= SENSOR_STALE_VL53L0X_MASK;
+    }
+    if(!I2C_ONLY_TEST && ssd1306_spi_init_completed &&
+       (now - ssd1306_spi_last_success_tick) >=
+               DISPLAY_PROGRESS_STALE_TIMEOUT_MS){
+      stale_mask |= SPI_STALE_SSD1306_MASK;
     }
     sensor_data_stale_mask = stale_mask;
     subsystem_stale_mask = stale_mask;
@@ -3405,40 +4105,56 @@ void starthealthtask(void *argument)
     bool startup_grace_elapsed =
             (now - startup_tick) >= WATCHDOG_STARTUP_GRACE_MS;
     if(startup_grace_elapsed){
-      if((!bme280_init_completed || !mpu6050_init_completed) &&
+      if((!bme280_init_completed || !mpu6500_init_completed) &&
          (g_system_bus_health[SYSTEM_BUS_I2C1].state == SYSTEM_BUS_STATE_OK)){
         system_health_bus_record_failure(SYSTEM_BUS_I2C1,
                 (int32_t)i2c_manager_last_result(I2C1));
       }
 
-      if(!REDUCED_I2C_CAN_TEST &&
-         (!rc522_init_completed || !nrf_rx_init_completed) &&
+      if(!I2C_ONLY_TEST && !rc522_init_completed &&
          (g_system_bus_health[SYSTEM_BUS_SPI1].state == SYSTEM_BUS_STATE_OK)){
         system_health_bus_record_failure(SYSTEM_BUS_SPI1,
                 _spi_manager_uninited_struct);
       }
 
-      if(!REDUCED_I2C_CAN_TEST && !ili9341_init_completed &&
+      if(!I2C_ONLY_TEST && !ili9341_init_completed &&
          (g_system_bus_health[SYSTEM_BUS_SPI3].state == SYSTEM_BUS_STATE_OK)){
         system_health_bus_record_failure(SYSTEM_BUS_SPI3,
                 _spi_manager_uninited_struct);
       }
 
-      if(!REDUCED_I2C_CAN_TEST && !nrf_tx_init_completed &&
+#if WATCHDOG_MONITOR_NRF
+      if(!I2C_ONLY_TEST &&
+         (!nrf_rx_init_completed || !nrf_tx_init_completed) &&
+         (g_system_bus_health[SYSTEM_BUS_SPI1].state == SYSTEM_BUS_STATE_OK)){
+        system_health_bus_record_failure(SYSTEM_BUS_SPI1,
+                _spi_manager_uninited_struct);
+      }
+#endif
+
+      if((!adxl345_init_completed || !vl53l0x_init_completed) &&
+         (g_system_bus_health[SYSTEM_BUS_I2C2].state == SYSTEM_BUS_STATE_OK)){
+        system_health_bus_record_failure(SYSTEM_BUS_I2C2,
+                (int32_t)i2c_manager_last_result(I2C2));
+      }
+
+      if(!I2C_ONLY_TEST && !ssd1306_spi_init_completed &&
          (g_system_bus_health[SYSTEM_BUS_SPI3].state == SYSTEM_BUS_STATE_OK)){
         system_health_bus_record_failure(SYSTEM_BUS_SPI3,
                 _spi_manager_uninited_struct);
       }
 
+#if CAN2_RUNTIME_ENABLED && WATCHDOG_MONITOR_CAN
       if((g_can2_debug.initialized == 0) &&
          (g_system_bus_health[SYSTEM_BUS_CAN2].state == SYSTEM_BUS_STATE_OK)){
         system_health_bus_record_failure(SYSTEM_BUS_CAN2,
                 can_manager_not_initialized);
       }
+#endif
     }
 
     if((stale_mask & (SENSOR_STALE_BME280_MASK |
-            SENSOR_STALE_MPU6050_MASK)) != 0){
+            SENSOR_STALE_MPU6500_MASK)) != 0){
       if(g_system_bus_health[SYSTEM_BUS_I2C1].state == SYSTEM_BUS_STATE_OK){
         system_health_bus_record_failure(SYSTEM_BUS_I2C1,
                 (int32_t)i2c_manager_last_result(I2C1));
@@ -3449,12 +4165,24 @@ void starthealthtask(void *argument)
         system_health_bus_record_failure(SYSTEM_BUS_SPI1, _spi_manager_timeout);
       }
     }
+    if((stale_mask & (SENSOR_STALE_ADXL345_MASK |
+            SENSOR_STALE_VL53L0X_MASK)) != 0){
+      if(g_system_bus_health[SYSTEM_BUS_I2C2].state == SYSTEM_BUS_STATE_OK){
+        system_health_bus_record_failure(SYSTEM_BUS_I2C2,
+                (int32_t)i2c_manager_last_result(I2C2));
+      }
+    }
     if((stale_mask & SPI_STALE_DISPLAY_MASK) != 0){
       if(g_system_bus_health[SYSTEM_BUS_SPI3].state == SYSTEM_BUS_STATE_OK){
         system_health_bus_record_failure(SYSTEM_BUS_SPI3, _spi_manager_timeout);
       }
     }
     if((stale_mask & SPI_STALE_NRF_TX_MASK) != 0){
+      if(g_system_bus_health[SYSTEM_BUS_SPI1].state == SYSTEM_BUS_STATE_OK){
+        system_health_bus_record_failure(SYSTEM_BUS_SPI1, _spi_manager_timeout);
+      }
+    }
+    if((stale_mask & SPI_STALE_SSD1306_MASK) != 0){
       if(g_system_bus_health[SYSTEM_BUS_SPI3].state == SYSTEM_BUS_STATE_OK){
         system_health_bus_record_failure(SYSTEM_BUS_SPI3, _spi_manager_timeout);
       }
@@ -3463,11 +4191,20 @@ void starthealthtask(void *argument)
     system_health_bus_refresh_ages(now);
     supervise_faulted_buses(now);
     bool subsystems_initialized = bme280_init_completed &&
-            mpu6050_init_completed && (g_can2_debug.initialized != 0);
-#if !REDUCED_I2C_CAN_TEST
+            mpu6500_init_completed && adxl345_init_completed &&
+            vl53l0x_init_completed;
+#if CAN2_RUNTIME_ENABLED && WATCHDOG_MONITOR_CAN
     subsystems_initialized = subsystems_initialized &&
-            rc522_init_completed && nrf_tx_init_completed &&
-            nrf_rx_init_completed && ili9341_init_completed;
+            (g_can2_debug.initialized != 0);
+#endif
+#if !I2C_ONLY_TEST
+    subsystems_initialized = subsystems_initialized &&
+            rc522_init_completed && ili9341_init_completed &&
+            ssd1306_spi_init_completed;
+#endif
+#if !I2C_ONLY_TEST && WATCHDOG_MONITOR_NRF
+    subsystems_initialized = subsystems_initialized &&
+            nrf_tx_init_completed && nrf_rx_init_completed;
 #endif
     if(!health_normal_monitoring_started && subsystems_initialized &&
        all_tasks_healthy && stale_mask == 0){
@@ -3479,29 +4216,40 @@ void starthealthtask(void *argument)
     bool bus_fault_active = false;
     uint32_t tolerated_missing_heartbeat_mask = 0;
     for(uint32_t index = 0; index < SYSTEM_BUS_COUNT; index++){
+#if !WATCHDOG_MONITOR_CAN
+      if(index == SYSTEM_BUS_CAN2) continue;
+#endif
       if(g_system_bus_health[index].state != SYSTEM_BUS_STATE_OK){
         bus_fault_active = true;
 
         if(index == SYSTEM_BUS_I2C1){
           tolerated_missing_heartbeat_mask |=
                   SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_BME280) |
-                  SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_MPU6050);
+                  SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_MPU6500);
+        }
+        if(index == SYSTEM_BUS_I2C2){
+          tolerated_missing_heartbeat_mask |=
+                  SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_ADXL345) |
+                  SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_VL53L0X);
         }
         if(index == SYSTEM_BUS_SPI1){
           tolerated_missing_heartbeat_mask |=
                   SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_RC522) |
-                  SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_NRF_RX);
+                  SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_NRF_RX) |
+                  SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_NRF_TX);
         }
         if(index == SYSTEM_BUS_SPI3){
           tolerated_missing_heartbeat_mask |=
-                  SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_NRF_TX) |
-                  SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_DISPLAY);
+                  SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_DISPLAY) |
+                  SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_SSD1306_SPI);
         }
+#if CAN2_RUNTIME_ENABLED
         if(index == SYSTEM_BUS_CAN2){
           tolerated_missing_heartbeat_mask |=
                   SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_CAN_RX) |
                   SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_CAN_TX);
         }
+#endif
       }
     }
 
@@ -3552,11 +4300,23 @@ void StartCAN2ReadTask(void *argument)
     if(init_status != can_manager_ok) osDelay(100);
   }
   while(init_status != can_manager_ok);
+  uint32_t can_link_start_tick = osKernelGetTickCount();
 
   for(;;)
   {
     system_health_heartbeat(HEALTH_TASK_CAN_RX);
-    uint32_t flags = osThreadFlagsWait(CAN_MANAGER_RX_EVENT_ANY, osFlagsWaitAny, 500);
+    uint32_t now = osKernelGetTickCount();
+    uint32_t rx_reference_tick = g_communication_link_debug.can_rx_last_tick;
+    if(rx_reference_tick == 0) rx_reference_tick = can_link_start_tick;
+    g_communication_link_debug.can_rx_timeout =
+            (now - rx_reference_tick) >= COMMUNICATION_RX_TIMEOUT_MS;
+    if(g_communication_link_debug.can_rx_timeout){
+      /* Kopuk hatta son HIGH/LOW seviyesini korumak yerine guvenli ve
+         gozle ayirt edilebilir duruma gec. */
+      LL_GPIO_ResetOutputPin(CAN_LINK_LED_GPIO_Port, CAN_LINK_LED_Pin);
+    }
+
+    uint32_t flags = osThreadFlagsWait(CAN_MANAGER_RX_EVENT_ANY, osFlagsWaitAny, 100);
 
     if((flags & osFlagsError) != 0) continue;
 
@@ -3566,9 +4326,26 @@ void StartCAN2ReadTask(void *argument)
     while((received_frame = can_manager_rx_peek(CAN2)) != NULL)
     {
       /* received_frame gercek ring-buffer hucresidir; burada ikinci bir frame kopyasi olusturulmaz. */
-        if(received_frame->id == 0x103)
-        {
-            /* received_frame->data burada işlenir. */
+        if(received_frame->id == 0x103 &&
+           ((received_frame->dlc == 4 &&
+             memcmp(received_frame->data, "HIGH", 4) == 0) ||
+            (received_frame->dlc == 3 &&
+             memcmp(received_frame->data, "LOW", 3) == 0))){
+          if(received_frame->dlc == 4){
+            LL_GPIO_SetOutputPin(CAN_LINK_LED_GPIO_Port, CAN_LINK_LED_Pin);
+          }
+          else{
+            LL_GPIO_ResetOutputPin(CAN_LINK_LED_GPIO_Port, CAN_LINK_LED_Pin);
+          }
+          if(osMutexAcquire(sensor_data_mutexHandle, 10) == osOK){
+            copy_display_text(can_display_data.rx_text,
+                    sizeof(can_display_data.rx_text), received_frame->data,
+                    received_frame->dlc);
+            can_display_data.rx_update_count++;
+            osMutexRelease(sensor_data_mutexHandle);
+          }
+          g_communication_link_debug.can_rx_last_tick = osKernelGetTickCount();
+          g_communication_link_debug.can_rx_timeout = false;
         }
       (void)can_manager_rx_release(CAN2);
     }
@@ -3589,28 +4366,51 @@ void StartCAN2WriteTask(void *argument)
   (void)argument;
 
   can_frame_t test_frame = {
-    .id = 0x407U,
-    .dlc = 7U,
+    .id = 0x407,
+    .dlc = 4,
     .extended_id = false,
     .remote_frame = false,
-    .data = {'F', '4', '0', '7', 'C', 'A', 'N', 0U},
-    .timestamp = 0U
+    .data = {'H', 'I', 'G', 'H', 0, 0, 0, 0},
+    .timestamp = 0
   };
+  static const uint8_t can_high[] = "HIGH";
+  static const uint8_t can_low[] = "LOW";
 
   (void)osThreadFlagsWait(CAN_MANAGER_TX_EVENT_READY, osFlagsWaitAny, osWaitForever);
-  uint32_t next_transmit_tick = osKernelGetTickCount();
+  uint32_t next_transmit_tick =
+          ((osKernelGetTickCount() / COMMUNICATION_PERIOD_MS) + 1) *
+          COMMUNICATION_PERIOD_MS;
 
   for(;;)
   {
     system_health_heartbeat(HEALTH_TASK_CAN_TX);
-    next_transmit_tick += 1000;
     osDelayUntil(next_transmit_tick);
+    next_transmit_tick += COMMUNICATION_PERIOD_MS;
 
+    uint32_t phase = (osKernelGetTickCount() / COMMUNICATION_PERIOD_MS) & 1;
+    memset(test_frame.data, 0, sizeof(test_frame.data));
+    if(phase == 0){
+      memcpy(test_frame.data, can_high, sizeof(can_high) - 1);
+      test_frame.dlc = sizeof(can_high) - 1;
+    }
+    else{
+      memcpy(test_frame.data, can_low, sizeof(can_low) - 1);
+      test_frame.dlc = sizeof(can_low) - 1;
+    }
     can_manager_status_t send_status = can_manager_send(CAN2, &test_frame);
     if(send_status == can_manager_no_tx_mailbox)
     {
       (void)osThreadFlagsWait(CAN_MANAGER_TX_EVENT_ANY, osFlagsWaitAny, 100);
-      (void)can_manager_send(CAN2, &test_frame);
+      send_status = can_manager_send(CAN2, &test_frame);
+    }
+    if(send_status == can_manager_ok){
+      if(osMutexAcquire(sensor_data_mutexHandle, 10) == osOK){
+        copy_display_text(can_display_data.tx_text,
+                sizeof(can_display_data.tx_text), test_frame.data,
+                test_frame.dlc);
+        can_display_data.tx_update_count++;
+        osMutexRelease(sensor_data_mutexHandle);
+      }
     }
   }
   /* USER CODE END StartCAN2WriteTask */

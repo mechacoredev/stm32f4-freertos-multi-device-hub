@@ -268,7 +268,8 @@ ili9341_handle_t ili9341_init(ili9341_user_configs* config) {
     memcpy(&dev->config, config, sizeof(ili9341_user_configs));
     dev->width = ILI9341_TFTWIDTH;
     dev->height = ILI9341_TFTHEIGHT;
-    if(config->rotation == ILI9341_ROTATION_90) {
+    if(config->rotation == ILI9341_ROTATION_90 ||
+            config->rotation == ILI9341_ROTATION_270) {
         dev->width = ILI9341_LANDSCAPE_WIDTH;
         dev->height = ILI9341_LANDSCAPE_HEIGHT;
     }
@@ -296,6 +297,10 @@ ili9341_handle_t ili9341_init(ili9341_user_configs* config) {
     }
     else if(config->rotation == ILI9341_ROTATION_180) {
         memory_access[0] = 0x88;
+    }
+    else if(config->rotation == ILI9341_ROTATION_270) {
+        /* MY | MX | MV | BGR: ROTATION_90'in tam 180 derece tersi. */
+        memory_access[0] = 0xE8;
     }
     static const uint8_t pixel_format[] = {0x55};
     static const uint8_t frame_rate[] = {0x00, 0x18};

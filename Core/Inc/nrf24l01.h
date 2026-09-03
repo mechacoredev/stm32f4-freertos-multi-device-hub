@@ -52,7 +52,7 @@ typedef struct{
 	osSemaphoreId_t spi_semaphore;
 	// EXTI kesmesini bekleyeceğimiz Görev (Task)
 	osThreadId_t notify_task;
-	uint32_t notify_flag;     // YENİ: MPU6050'deki gibi hangi bayrağı kaldıracağımızı belirler
+	uint32_t notify_flag;     // YENİ: MPU6500'deki gibi hangi bayrağı kaldıracağımızı belirler
 }nrf24l01_user_configs;
 
 struct nrf24l01_t;
@@ -60,6 +60,7 @@ typedef struct nrf24l01_t* nrf24l01_handle_t;
 
 // Kullanılacak Fonksiyon Prototipleri
 nrf24l01_handle_t nrf24l01_init(nrf24l01_user_configs* config);
+nrf24l01_return_status nrf24l01_reinitialize(nrf24l01_handle_t dev);
 bool nrf24l01_validate(nrf24l01_handle_t dev);
 
 // DMA Tabanlı Asenkron Veri Transferleri

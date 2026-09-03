@@ -31,7 +31,7 @@ struct nrf24l01_t{
 
 	osSemaphoreId_t spi_semaphore;
 	osThreadId_t notify_task;
-	uint32_t notify_flag;     // YENİ: MPU6050'deki gibi hangi bayrağı kaldıracağımızı belirler
+	uint32_t notify_flag;     // YENİ: MPU6500'deki gibi hangi bayrağı kaldıracağımızı belirler
 	uint8_t address[5];
 
     // DMA transferleri için dahili RAM alanları (Max 33 Byte)
@@ -158,6 +158,7 @@ nrf24l01_handle_t nrf24l01_init(nrf24l01_user_configs* config){
 	if(config->spi_handle == NULL || config->dma_handle == NULL ||
 	   config->spi_semaphore == NULL || config->ce_port == NULL ||
 	   config->csn_port == NULL){
+		next_nrf_free_index--;
 		return NULL;
 	}
 
@@ -191,7 +192,10 @@ nrf24l01_handle_t nrf24l01_init(nrf24l01_user_configs* config){
 	write_data(dev, REG_RX_PW_P0, 0);
 	nrf24l01_return_status dynamic_payload_status;
 	dynamic_payload_status = enable_dynamic_payloads(dev);
-	if(dynamic_payload_status != _nrf24l01_ok) return NULL;
+	if(dynamic_payload_status != _nrf24l01_ok){
+		next_nrf_free_index--;
+		return NULL;
+	}
 
 	write_data_burst(dev, REG_RX_ADDR_P0, dev->address, 5);
 	write_data_burst(dev, REG_TX_ADDR, dev->address, 5);
@@ -201,6 +205,35 @@ nrf24l01_handle_t nrf24l01_init(nrf24l01_user_configs* config){
 	nrf24l01_clear_interrupts(dev);
 
 	return dev;
+}
+
+nrf24l01_return_status nrf24l01_reinitialize(nrf24l01_handle_t dev){
+	if(dev == NULL) return _nrf24l01_fail;
+
+	LL_GPIO_SetOutputPin(dev->csn_port, dev->csn_pin);
+	LL_GPIO_ResetOutputPin(dev->ce_port, dev->ce_pin);
+	osDelay(5);
+
+	write_data(dev, REG_CONFIG, 0x0A);
+	write_data(dev, REG_EN_AA, 0x01);
+	write_data(dev, REG_EN_RXADDR, 0x01);
+	write_data(dev, REG_SETUP_AW, 0x03);
+	write_data(dev, REG_SETUP_RETR, 0x3F);
+	write_data(dev, REG_RF_CH, 76);
+	write_data(dev, REG_RF_SETUP, 0x07);
+	write_data(dev, REG_RX_PW_P0, 0);
+	if(enable_dynamic_payloads(dev) != _nrf24l01_ok){
+		return _nrf24l01_device_not_found;
+	}
+	write_data_burst(dev, REG_RX_ADDR_P0, dev->address, 5);
+	write_data_burst(dev, REG_TX_ADDR, dev->address, 5);
+	flush_tx(dev);
+	flush_rx(dev);
+	nrf24l01_clear_interrupts(dev);
+
+	if(!nrf24l01_validate(dev)) return _nrf24l01_device_not_found;
+	nrf24l01_start_listening(dev);
+	return _nrf24l01_ok;
 }
 
 bool nrf24l01_validate(nrf24l01_handle_t dev){

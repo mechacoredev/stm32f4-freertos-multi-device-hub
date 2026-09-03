@@ -123,6 +123,7 @@ struct rc522_t;
 typedef struct rc522_t* rc522_handle_t;
 
 rc522_handle_t rc522_init(rc522_user_configs* config);
+bool rc522_recover(rc522_handle_t dev);
 uint8_t rc522_get_version(rc522_handle_t dev);
 
 uint8_t rc522_request(rc522_handle_t dev, uint8_t reqmode, uint8_t* tagtype);

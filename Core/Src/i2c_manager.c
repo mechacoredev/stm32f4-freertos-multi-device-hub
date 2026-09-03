@@ -7,7 +7,9 @@ typedef enum{
     I2C_DMA_REGISTER_SENT,
     I2C_DMA_RESTART_SENT,
     I2C_DMA_READ_ADDRESS_SENT,
-    I2C_DMA_READING
+    I2C_DMA_READING,
+    I2C_DMA_WRITING,
+    I2C_DMA_WRITE_WAIT_BTF
 } i2c_dma_state_t;
 
 typedef struct{
@@ -22,7 +24,9 @@ typedef struct{
     uint8_t device_address;
     uint8_t register_address;
     uint8_t* receive_buffer;
+	uint8_t* transmit_buffer;
     uint16_t size;
+	i2c_manager_operation_t operation;
     volatile i2c_dma_state_t state;
     volatile i2c_manager_return_status result;
 } i2c_bus_context_t;
@@ -107,28 +111,33 @@ static bool address_or_nack(I2C_TypeDef* i2c){
     return LL_I2C_IsActiveFlag_ADDR(i2c) || LL_I2C_IsActiveFlag_AF(i2c);
 }
 
-static i2c_manager_return_status active_hardware_error(I2C_TypeDef* i2c){
-    if(LL_I2C_IsActiveFlag_AF(i2c)) return _i2c_manager_nack;
-    if(LL_I2C_IsActiveFlag_BERR(i2c)){
-        volatile i2c_manager_diagnostics_t* diagnostics =
-                get_diagnostics(i2c);
-        bool controlled_final_stop = diagnostics != NULL &&
-                diagnostics->phase == I2C_MANAGER_PHASE_DATA &&
-                LL_I2C_IsActiveFlag_MSL(i2c) &&
-                (i2c->CR1 & I2C_CR1_STOP) != 0;
-        if(controlled_final_stop){
-            /* Controller modunda BERR mevcut transferi durdurmaz. Bu hata
-             * yalnizca bizim son-byte STOP penceremizde gorulurse temizlenip
-             * RXNE beklenmeye devam edilir. Diger fazlarda gercek hatadir. */
-            LL_I2C_ClearFlag_BERR(i2c);
+static bool clear_spurious_controller_berr(I2C_TypeDef* i2c){
+    if(!LL_I2C_IsActiveFlag_BERR(i2c) ||
+            !LL_I2C_IsActiveFlag_MSL(i2c)){
+        return false;
+    }
+
+    /* STM32F405/407 errata ES0182, I2C 2.10.1:
+     * Controller modunda BERR sahte olarak set olabilir. Bu durum devam
+     * eden transferi bozmaz; ST yalnizca BERR'in temizlenmesini ister. */
+    volatile i2c_manager_diagnostics_t* diagnostics = get_diagnostics(i2c);
+    if(diagnostics != NULL){
+        diagnostics->controller_berr_ignored_count++;
+        if(diagnostics->phase == I2C_MANAGER_PHASE_DATA &&
+                (i2c->CR1 & I2C_CR1_STOP) != 0){
             diagnostics->controlled_stop_berr_count++;
         }
-        else{
-            return _i2c_manager_bus_error;
-        }
     }
+    LL_I2C_ClearFlag_BERR(i2c);
+    return true;
+}
+
+static i2c_manager_return_status active_hardware_error(I2C_TypeDef* i2c){
+    if(LL_I2C_IsActiveFlag_AF(i2c)) return _i2c_manager_nack;
     if(LL_I2C_IsActiveFlag_ARLO(i2c)) return _i2c_manager_arbitration_lost;
     if(LL_I2C_IsActiveFlag_OVR(i2c)) return _i2c_manager_overrun;
+    clear_spurious_controller_berr(i2c);
+    if(LL_I2C_IsActiveFlag_BERR(i2c)) return _i2c_manager_bus_error;
     return _i2c_manager_ok;
 }
 
@@ -193,11 +202,26 @@ static void capture_failure(I2C_TypeDef* i2c,
     diagnostics->last_sr2 = i2c->SR2;
     diagnostics->last_cr1 = i2c->CR1;
     diagnostics->last_cr2 = i2c->CR2;
+    diagnostics->last_failure_tick = get_tick();
     diagnostics->last_owner_task = diagnostics->owner_task;
     diagnostics->last_owner_name = diagnostics->owner_name;
     if(result == _i2c_manager_timeout) diagnostics->timeout_count++;
     else if(result == _i2c_manager_nack) diagnostics->nack_count++;
-    else diagnostics->hardware_error_count++;
+    else{
+        diagnostics->hardware_error_count++;
+        if(result == _i2c_manager_bus_error){
+            diagnostics->bus_error_count++;
+        }
+        else if(result == _i2c_manager_arbitration_lost){
+            diagnostics->arbitration_lost_count++;
+        }
+        else if(result == _i2c_manager_overrun){
+            diagnostics->overrun_count++;
+        }
+        else if(result == _i2c_manager_dma_error){
+            diagnostics->dma_error_count++;
+        }
+    }
 }
 
 static void begin_transaction(I2C_TypeDef* i2c,
@@ -794,6 +818,7 @@ static void dma_cleanup(i2c_bus_context_t* bus){
     LL_I2C_DisableIT_BUF(bus->i2c);
     LL_I2C_DisableIT_ERR(bus->i2c);
     LL_I2C_DisableDMAReq_RX(bus->i2c);
+	LL_I2C_DisableDMAReq_TX(bus->i2c);
     LL_I2C_DisableLastDMA(bus->i2c);
     LL_DMA_DisableIT_TC(bus->dma, bus->dma_stream);
     LL_DMA_DisableIT_TE(bus->dma, bus->dma_stream);
@@ -812,7 +837,12 @@ static void notify_dispatcher(i2c_bus_context_t* bus){
 static void finish_from_isr(i2c_bus_context_t* bus,
         i2c_manager_return_status result){
     set_phase(bus->i2c, I2C_MANAGER_PHASE_STOP);
-    LL_I2C_GenerateStopCondition(bus->i2c);
+    /* ARLO donanimi controller modundan cikarir. MSL=0 iken STOP yazmak
+     * STOP bitini temizlenemeyen bir durumda birakip sonraki transferi
+     * kilitleyebilir. */
+    if(LL_I2C_IsActiveFlag_MSL(bus->i2c)){
+        LL_I2C_GenerateStopCondition(bus->i2c);
+    }
     dma_cleanup(bus);
     bus->result = result;
     volatile i2c_manager_diagnostics_t* diagnostics =
@@ -863,7 +893,9 @@ i2c_manager_return_status i2c_manager_read_dma(DMA_TypeDef* dma,
     bus->device_address = device_address;
     bus->register_address = register_address;
     bus->receive_buffer = data;
+	bus->transmit_buffer = NULL;
     bus->size = size;
+	bus->operation = I2C_MANAGER_OPERATION_READ_DMA;
     bus->result = _i2c_manager_busy;
     bus->state = I2C_DMA_START_SENT;
 
@@ -878,6 +910,67 @@ i2c_manager_return_status i2c_manager_read_dma(DMA_TypeDef* dma,
     LL_DMA_SetMemorySize(dma, stream, LL_DMA_MDATAALIGN_BYTE);
     LL_DMA_ConfigAddresses(dma, stream, LL_I2C_DMA_GetRegAddr(i2c),
             (uint32_t)data, LL_DMA_DIRECTION_PERIPH_TO_MEMORY);
+    LL_DMA_SetDataLength(dma, stream, size);
+    LL_I2C_EnableIT_EVT(i2c);
+    LL_I2C_EnableIT_BUF(i2c);
+    LL_I2C_EnableIT_ERR(i2c);
+    set_phase(i2c, I2C_MANAGER_PHASE_START);
+    LL_I2C_GenerateStartCondition(i2c);
+    return _i2c_manager_ok;
+}
+
+i2c_manager_return_status i2c_manager_write_dma(DMA_TypeDef* dma,
+        uint32_t stream, I2C_TypeDef* i2c, uint8_t device_address,
+        uint8_t control_or_register, uint8_t* data, uint16_t size){
+    if(job_service.dispatcher != NULL &&
+            osThreadGetId() != job_service.dispatcher){
+        return _i2c_manager_fail;
+    }
+    if(size == 0 || data == NULL) return _i2c_manager_size_0;
+    i2c_bus_context_t* bus = get_bus(i2c);
+    if(bus == NULL || bus->mutex == NULL) return _i2c_manager_uninited_struct;
+    i2c_manager_return_status lock_status = acquire_bus(bus, i2c, 0,
+            I2C_MANAGER_OPERATION_WRITE_DMA, device_address,
+            control_or_register);
+    if(lock_status != _i2c_manager_ok) return lock_status;
+    if(LL_I2C_IsActiveFlag_BUSY(i2c)){
+        capture_failure(i2c, _i2c_manager_busy);
+        if(!recover_stuck_bus(bus, i2c)){
+            release_bus(bus, i2c, _i2c_manager_bus_error);
+            return _i2c_manager_bus_error;
+        }
+    }
+
+    clear_hardware_errors(i2c);
+    restore_receive_defaults(i2c);
+    LL_I2C_DisableIT_EVT(i2c);
+    LL_I2C_DisableIT_BUF(i2c);
+    LL_I2C_DisableIT_ERR(i2c);
+    LL_I2C_DisableDMAReq_TX(i2c);
+    LL_DMA_DisableIT_TC(dma, stream);
+    LL_DMA_DisableIT_TE(dma, stream);
+    LL_DMA_DisableStream(dma, stream);
+    clear_dma_flags(dma, stream);
+
+    bus->dma = dma;
+    bus->dma_stream = stream;
+    bus->device_address = device_address;
+    bus->register_address = control_or_register;
+    bus->receive_buffer = NULL;
+    bus->transmit_buffer = data;
+    bus->size = size;
+    bus->operation = I2C_MANAGER_OPERATION_WRITE_DMA;
+    bus->result = _i2c_manager_busy;
+    bus->state = I2C_DMA_START_SENT;
+
+    LL_DMA_SetDataTransferDirection(dma, stream, LL_DMA_DIRECTION_MEMORY_TO_PERIPH);
+    LL_DMA_SetMode(dma, stream, LL_DMA_MODE_NORMAL);
+    LL_DMA_SetPeriphIncMode(dma, stream, LL_DMA_PERIPH_NOINCREMENT);
+    LL_DMA_SetMemoryIncMode(dma, stream, LL_DMA_MEMORY_INCREMENT);
+    LL_DMA_SetPeriphSize(dma, stream, LL_DMA_PDATAALIGN_BYTE);
+    LL_DMA_SetMemorySize(dma, stream, LL_DMA_MDATAALIGN_BYTE);
+    LL_DMA_ConfigAddresses(dma, stream, (uint32_t)data,
+            LL_I2C_DMA_GetRegAddr(i2c), LL_DMA_DIRECTION_MEMORY_TO_PERIPH);
     LL_DMA_SetDataLength(dma, stream, size);
     LL_I2C_EnableIT_EVT(i2c);
     LL_I2C_EnableIT_BUF(i2c);
@@ -912,9 +1005,21 @@ void i2c_manager_event_handler(I2C_TypeDef* i2c){
         break;
     case I2C_DMA_REGISTER_SENT:
         if(LL_I2C_IsActiveFlag_BTF(i2c)){
-            set_phase(i2c, I2C_MANAGER_PHASE_RESTART);
-            LL_I2C_GenerateStartCondition(i2c);
-            bus->state = I2C_DMA_RESTART_SENT;
+			if(bus->operation == I2C_MANAGER_OPERATION_WRITE_DMA){
+				set_phase(i2c, I2C_MANAGER_PHASE_DATA);
+				LL_DMA_EnableIT_TC(bus->dma, bus->dma_stream);
+				LL_DMA_EnableIT_TE(bus->dma, bus->dma_stream);
+				LL_I2C_EnableDMAReq_TX(i2c);
+				LL_DMA_EnableStream(bus->dma, bus->dma_stream);
+				bus->state = I2C_DMA_WRITING;
+				LL_I2C_DisableIT_EVT(i2c);
+				LL_I2C_DisableIT_BUF(i2c);
+			}
+			else{
+				set_phase(i2c, I2C_MANAGER_PHASE_RESTART);
+				LL_I2C_GenerateStartCondition(i2c);
+				bus->state = I2C_DMA_RESTART_SENT;
+			}
         }
         break;
     case I2C_DMA_RESTART_SENT:
@@ -945,6 +1050,13 @@ void i2c_manager_event_handler(I2C_TypeDef* i2c){
         }
         break;
     case I2C_DMA_READING:
+	case I2C_DMA_WRITING:
+		break;
+	case I2C_DMA_WRITE_WAIT_BTF:
+		if(LL_I2C_IsActiveFlag_BTF(i2c)){
+			finish_from_isr(bus, _i2c_manager_ok);
+		}
+		break;
     case I2C_DMA_IDLE:
     default:
         break;
@@ -980,18 +1092,43 @@ void i2c_manager_dma_handler(DMA_TypeDef* dma, uint32_t stream){
     bool error = false;
     read_dma_flags(dma, stream, &complete, &error);
     clear_dma_flags(dma, stream);
-    if(error) finish_from_isr(bus, _i2c_manager_dma_error);
-    else if(complete) finish_from_isr(bus, _i2c_manager_ok);
+	if(error){
+		capture_failure(bus->i2c, _i2c_manager_dma_error);
+		finish_from_isr(bus, _i2c_manager_dma_error);
+	}
+	else if(complete && bus->state == I2C_DMA_WRITING){
+		LL_I2C_DisableDMAReq_TX(bus->i2c);
+		LL_DMA_DisableIT_TC(bus->dma, bus->dma_stream);
+		LL_DMA_DisableIT_TE(bus->dma, bus->dma_stream);
+		LL_DMA_DisableStream(bus->dma, bus->dma_stream);
+		bus->state = I2C_DMA_WRITE_WAIT_BTF;
+		LL_I2C_EnableIT_EVT(bus->i2c);
+	}
+	else if(complete){
+		finish_from_isr(bus, _i2c_manager_ok);
+	}
 }
 
 void i2c_manager_error_handler(I2C_TypeDef* i2c){
     i2c_bus_context_t* bus = get_bus(i2c);
     if(bus == NULL || bus->state == I2C_DMA_IDLE) return;
+
+    /* Controller modundaki tek hata BERR ise ES0182 workaround'u geregi
+     * transferi durdurma; bayragi temizle ve DMA/event akisina devam et. */
+    clear_spurious_controller_berr(i2c);
+    bool acknowledge_failure = LL_I2C_IsActiveFlag_AF(i2c);
+    bool bus_error = LL_I2C_IsActiveFlag_BERR(i2c);
+    bool arbitration_lost = LL_I2C_IsActiveFlag_ARLO(i2c);
+    bool overrun = LL_I2C_IsActiveFlag_OVR(i2c);
+    if(!acknowledge_failure && !bus_error && !arbitration_lost && !overrun){
+        return;
+    }
+
     i2c_manager_return_status result = _i2c_manager_fail;
-    if(LL_I2C_IsActiveFlag_AF(i2c)) result = _i2c_manager_nack;
-    if(LL_I2C_IsActiveFlag_BERR(i2c)) result = _i2c_manager_bus_error;
-    if(LL_I2C_IsActiveFlag_ARLO(i2c)) result = _i2c_manager_arbitration_lost;
-    if(LL_I2C_IsActiveFlag_OVR(i2c)) result = _i2c_manager_overrun;
+    if(acknowledge_failure) result = _i2c_manager_nack;
+    if(bus_error) result = _i2c_manager_bus_error;
+    if(overrun) result = _i2c_manager_overrun;
+    if(arbitration_lost) result = _i2c_manager_arbitration_lost;
     capture_failure(i2c, result);
     clear_hardware_errors(i2c);
     finish_from_isr(bus, result);
@@ -1074,7 +1211,9 @@ i2c_manager_return_status i2c_manager_recover_bus(I2C_TypeDef* i2c){
 void i2c_manager_abort_transfer(I2C_TypeDef* i2c){
     i2c_bus_context_t* bus = get_bus(i2c);
     if(bus == NULL || bus->state == I2C_DMA_IDLE) return;
-    LL_I2C_GenerateStopCondition(i2c);
+    if(LL_I2C_IsActiveFlag_MSL(i2c)){
+        LL_I2C_GenerateStopCondition(i2c);
+    }
     dma_cleanup(bus);
     bus->result = _i2c_manager_aborted;
     bus->state = I2C_DMA_IDLE;

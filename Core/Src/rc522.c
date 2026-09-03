@@ -86,6 +86,40 @@ static void _rc522_reset(rc522_handle_t dev){
 	_rc522_write_data(dev, REG_CommandReg, PCD_SOFTRESET);
 }
 
+bool rc522_recover(rc522_handle_t dev){
+	if(dev == NULL) return false;
+
+	/* MCU reseti RC522'nin beslemesini kesmez. Cihazi RST hattiyla yeniden
+	 * baslat ve protokol/RF registerlarini tekrar kur. */
+	LL_GPIO_SetOutputPin(dev->cs_port, dev->cs_pin);
+	LL_GPIO_ResetOutputPin(dev->rst_port, dev->rst_pin);
+	osDelay(10);
+	LL_GPIO_SetOutputPin(dev->rst_port, dev->rst_pin);
+	osDelay(50);
+
+	if(dev->interrupt_task_handle != NULL && dev->interrupt_flag != 0U){
+		osThreadFlagsClear(dev->interrupt_flag);
+	}
+
+	_rc522_reset(dev);
+	osDelay(5);
+	_rc522_write_data(dev, REG_ComIrqReg, 0x7F);
+	_rc522_write_data(dev, REG_DivIrqReg, 0x7F);
+	_rc522_set_bitmask(dev, REG_FIFOLevelReg, 0x80);
+	_rc522_write_data(dev, REG_CommandReg, PCD_IDLE);
+	_rc522_set_bitmask(dev, REG_DivlEnReg, 0x80);
+	_rc522_write_data(dev, REG_TModeReg, 0x8D);
+	_rc522_write_data(dev, REG_TPrescalerReg, 0x3E);
+	_rc522_write_data(dev, REG_TReloadReg_LSB, 30);
+	_rc522_write_data(dev, REG_TReloadReg_MSB, 0);
+	_rc522_write_data(dev, REG_TxASKReg, 0x40);
+	_rc522_write_data(dev, REG_ModeReg, 0x3D);
+	_rc522_antenna_on(dev);
+
+	uint8_t version = rc522_get_version(dev);
+	return version != 0U && version != 0xFFU;
+}
+
 // --- Init ---
 
 rc522_handle_t rc522_init(rc522_user_configs* config){
@@ -103,24 +137,10 @@ rc522_handle_t rc522_init(rc522_user_configs* config){
 
 	// CS'i idle (HIGH) durumda garantiye al
 	LL_GPIO_SetOutputPin(dev->cs_port, dev->cs_pin);
-
-	// Donanımsal reset darbesi
-	LL_GPIO_ResetOutputPin(dev->rst_port, dev->rst_pin);
-	osDelay(10);
-	LL_GPIO_SetOutputPin(dev->rst_port, dev->rst_pin);
-	osDelay(50);
-
-	_rc522_reset(dev);
-	_rc522_set_bitmask(dev, REG_DivlEnReg, 0x80);
-	_rc522_write_data(dev, REG_TModeReg, 0x8D);
-	_rc522_write_data(dev, REG_TPrescalerReg, 0x3E);
-	_rc522_write_data(dev, REG_TReloadReg_LSB, 30);
-	_rc522_write_data(dev, REG_TReloadReg_MSB, 0);
-	_rc522_write_data(dev, REG_TxASKReg, 0x40);
-	_rc522_write_data(dev, REG_ModeReg, 0x3D);
-	_rc522_set_bitmask(dev, REG_DivlEnReg, 0x80); // pull-up için eklendi
-	_rc522_antenna_on(dev);
-
+	if(!rc522_recover(dev)){
+		rc522_next_free_index--;
+		return NULL;
+	}
 	return dev;
 }
 
@@ -174,16 +194,16 @@ static uint8_t _rc522_to_card(rc522_handle_t dev, uint8_t command, uint8_t* send
 	n = _rc522_read_data(dev, REG_ComIrqReg);
 	_rc522_write_data(dev, REG_ComIrqReg, 0x7F);
 
-	if (flags == osFlagsErrorTimeout) {
-		i = 0;
+	/* Thread flag taski erken uyandirir; asil sonuc ComIrqReg'dir. Boylece
+	 * reset/gecis sirasinda kacirilan bir EXTI kenari islemi kaybettirmez. */
+	(void)flags;
+	if((n & 0x01U) != 0U){
 		_rc522_write_data(dev, REG_CommandReg, PCD_IDLE);
-	} else {
-		if (n & waitirq) {
-			i = 1;
-		} else {
-			i = 0;
-		}
+		_rc522_clear_bitmask(dev, REG_BitFramingReg, 0x80);
+		return MI_NOTAGERR;
 	}
+	i = ((n & waitirq) != 0U) ? 1U : 0U;
+	if(i == 0U) _rc522_write_data(dev, REG_CommandReg, PCD_IDLE);
 
 	_rc522_clear_bitmask(dev, REG_BitFramingReg, 0x80);
 
@@ -218,9 +238,7 @@ uint8_t rc522_request(rc522_handle_t dev, uint8_t reqmode, uint8_t* tagtype){
 	uint32_t backlen;
 	_rc522_write_data(dev, REG_BitFramingReg, 0x07);
 	uint8_t status = _rc522_to_card(dev, PCD_TRANSCEIVE, &reqmode, 1, tagtype, &backlen);
-	if((status != MI_OK) || (backlen != 0x10)){
-		status = MI_ERROR;
-	}
+	if(status == MI_OK && backlen != 0x10) status = MI_ERROR;
 	return status;
 }
 

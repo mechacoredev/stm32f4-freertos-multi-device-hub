@@ -19,7 +19,8 @@ typedef enum {
 typedef enum {
     ILI9341_ROTATION_0 = 0,
     ILI9341_ROTATION_90,
-    ILI9341_ROTATION_180
+    ILI9341_ROTATION_180,
+    ILI9341_ROTATION_270
 } ili9341_rotation_t;
 
 typedef struct {

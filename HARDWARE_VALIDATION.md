@@ -9,7 +9,7 @@ Use this checklist in order. A clean build is only the starting point; each stag
 - [ ] Check for shorts between 3.3 V, 5 V and ground.
 - [ ] Confirm I2C pull-ups and idle-high SDA/SCL.
 - [ ] Confirm every SPI device has a unique CS/CSN.
-- [ ] Confirm SPI3 TFT/nRF TX wiring; do not use the obsolete SPI2 TFT pin map.
+- [ ] Confirm SPI3 TFT/SSD1306 wiring; do not connect a second NRF to SPI3.
 - [ ] Confirm CANH-to-CANH and CANL-to-CANL.
 - [ ] Confirm exactly two 120-ohm CAN termination resistors at the physical ends.
 - [ ] Confirm both CAN nodes use 500 kbit/s timing.
@@ -18,7 +18,7 @@ Use this checklist in order. A clean build is only the starting point; each stag
 
 Start with `is_mcu_reset_allowed = false` so diagnostics remain visible instead of immediately rebooting.
 
-- [ ] Flash the STM32F103 CAN test firmware.
+- [ ] In the current I2C-only stage, leave STM32F103, CAN, SPI and NRF hardware disconnected.
 - [ ] Start the STM32F407 Debug build.
 - [ ] Confirm every enabled task reaches its normal loop.
 - [ ] Confirm no HardFault, assert or unexpected reset.
@@ -30,7 +30,7 @@ Start with `is_mcu_reset_allowed = false` so diagnostics remain visible instead 
 Observe:
 
 - `bme280_display_data`
-- `mpu6050_display_data`
+- `mpu6500_display_data`
 - the I2C1 entry in `g_system_bus_health`
 
 Tests:
@@ -53,23 +53,43 @@ Fault injection:
 8. With reset permission still false, confirm reset is reported as suppressed after the deadline.
 9. Repeat once with reset permission true only after the local recovery behavior is understood.
 
-## 4. SPI1 validation
+## 4. I2C2 validation
 
-Devices: RC522 and nRF24L01 RX.
+Observe:
+
+- `adxl345_display_data`
+- `vl53l0x_display_data`
+- `g_vl53l0x_debug`
+- `vl53l0x_dma_success_count`
+- `vl53l0x_dma_error_count`
+- the I2C2 entry in `g_system_bus_health`
+
+Tests:
+
+- [ ] ADXL345 X/Y/Z data updates approximately every 100 ms.
+- [ ] `g_vl53l0x_debug.init_stage` reaches 6 and identification values are `EE/AA/10`.
+- [ ] VL53L0X distance changes as a target is moved in front of the sensor.
+- [ ] `vl53l0x_display_data.update_count` and `vl53l0x_dma_success_count` increase.
+- [ ] I2C1 continues updating while both I2C2 sensors are active.
+- [ ] Disconnect and reconnect one I2C2 signal; confirm local recovery and resumed valid traffic.
+
+## 5. SPI1 validation
+
+Devices: RC522 and the single bidirectional nRF24L01.
 
 - [ ] RC522 operations complete and its display/debug data updates.
-- [ ] nRF24L01 RX receives packets.
+- [ ] nRF24L01 receives packets from Arduino Uno and transmits through the same radio.
 - [ ] CS/CSN lines never overlap.
 - [ ] DMA/IRQ success counts increase without error growth.
 - [ ] Disconnect and reconnect each device separately.
 - [ ] Confirm SPI recovery is followed by device-level validation.
 - [ ] Do not count a peripheral reset alone as a successful recovery.
 
-## 5. SPI3 shared-bus validation
+## 6. SPI3 shared-bus validation
 
-Devices: nRF24L01 TX, ILI9341 TFT1 and ILI9341 TFT2.
+Devices: ILI9341 TFT1, ILI9341 TFT2 and SPI SSD1306.
 
-- [ ] nRF TX packets continue while both displays refresh.
+- [ ] Both TFTs and the SPI SSD1306 refresh without overlapping CS windows.
 - [ ] TFT1 and TFT2 show their intended content.
 - [ ] `ili9341_dma_success_count` increases.
 - [ ] `ili9341_dma_error_count` remains stable.
@@ -77,7 +97,7 @@ Devices: nRF24L01 TX, ILI9341 TFT1 and ILI9341 TFT2.
 - [ ] Logic-analyzer capture confirms only one CS/CSN is low at a time.
 - [ ] Disconnect one SPI3 device and confirm the other clients remain diagnosable.
 
-## 6. CAN2 validation
+## 7. CAN2 validation
 
 Observe:
 
@@ -103,12 +123,12 @@ Fault injection:
 - [ ] Confirm recovery success is recorded only after real CAN progress.
 - [ ] Temporarily remove one termination resistor and record error behavior; restore it immediately after the test.
 
-## 7. Full simultaneous-load test
+## 8. Full simultaneous-load test
 
 Current result: **Passed for 15 minutes** with the complete connected configuration. All enabled devices operated as expected during that observation window. The individual evidence items below should still be retained for repeatable future test records.
 
 - [ ] Enable all sensor, radio, display and CAN tasks.
-- [ ] Run I2C1, SPI1, SPI3 and CAN2 concurrently.
+- [ ] Run I2C1, I2C2, SPI1, SPI3 and CAN2 concurrently.
 - [ ] Confirm every source update count increases.
 - [ ] Confirm maximum data ages stay within their intended periods.
 - [ ] Confirm RTOS tasks continue producing health heartbeats.
@@ -118,7 +138,7 @@ Current result: **Passed for 15 minutes** with the complete connected configurat
 - [ ] Capture a logic-analyzer trace for I2C and both SPI buses.
 - [ ] Capture CAN traffic or at least both-node counters and last frames.
 
-## 8. Endurance
+## 9. Endurance
 
 The final duration is a project decision; one hour is a useful development checkpoint, not a product-qualification test.
 

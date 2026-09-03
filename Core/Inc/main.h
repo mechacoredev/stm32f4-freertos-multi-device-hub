@@ -69,9 +69,9 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
-#define mpu6050_irq_pin_Pin LL_GPIO_PIN_1
-#define mpu6050_irq_pin_GPIO_Port GPIOB
-#define mpu6050_irq_pin_EXTI_IRQn EXTI1_IRQn
+#define mpu6500_irq_pin_Pin LL_GPIO_PIN_7
+#define mpu6500_irq_pin_GPIO_Port GPIOC
+#define mpu6500_irq_pin_EXTI_IRQn EXTI9_5_IRQn
 #define TFT1_DC_Pin LL_GPIO_PIN_10
 #define TFT1_DC_GPIO_Port GPIOE
 #define TFT1_RST_Pin LL_GPIO_PIN_11
@@ -84,13 +84,12 @@ void Error_Handler(void);
 #define TFT2_RST_GPIO_Port GPIOE
 #define TFT2_CS_Pin LL_GPIO_PIN_15
 #define TFT2_CS_GPIO_Port GPIOE
-#define nrf24_irq_pin_spi3_Pin LL_GPIO_PIN_6
-#define nrf24_irq_pin_spi3_GPIO_Port GPIOC
-#define nrf24_irq_pin_spi3_EXTI_IRQn EXTI9_5_IRQn
-#define nrf24_csn_pin_spi3_Pin LL_GPIO_PIN_8
-#define nrf24_csn_pin_spi3_GPIO_Port GPIOC
-#define nrf24_ce_pin_spi3_Pin LL_GPIO_PIN_9
-#define nrf24_ce_pin_spi3_GPIO_Port GPIOC
+#define SSD1306_SPI_RST_Pin LL_GPIO_PIN_6
+#define SSD1306_SPI_RST_GPIO_Port GPIOC
+#define SSD1306_SPI_CS_Pin LL_GPIO_PIN_8
+#define SSD1306_SPI_CS_GPIO_Port GPIOC
+#define SSD1306_SPI_DC_Pin LL_GPIO_PIN_9
+#define SSD1306_SPI_DC_GPIO_Port GPIOC
 #define nrf24_ce_pin_spi1_Pin LL_GPIO_PIN_0
 #define nrf24_ce_pin_spi1_GPIO_Port GPIOD
 #define nrf24_csn_pin_spi1_Pin LL_GPIO_PIN_1
@@ -105,6 +104,10 @@ void Error_Handler(void);
 #define rc522_cs_pin_GPIO_Port GPIOD
 #define rc522_rst_pin_Pin LL_GPIO_PIN_7
 #define rc522_rst_pin_GPIO_Port GPIOD
+#define CAN_LINK_LED_Pin LL_GPIO_PIN_12
+#define CAN_LINK_LED_GPIO_Port GPIOD
+#define NRF_LINK_LED_Pin LL_GPIO_PIN_13
+#define NRF_LINK_LED_GPIO_Port GPIOD
 
 /* USER CODE BEGIN Private defines */
 
