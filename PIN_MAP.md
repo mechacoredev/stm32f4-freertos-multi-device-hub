@@ -18,10 +18,10 @@ Both SDA and SCL require pull-up resistors to 3.3 V. Some breakout boards alread
 
 | Signal | STM32F407 pin | Connected devices |
 |---|---|---|
-| I2C2_SCL | PB10 | ADXL345 SCL, VL53L0X SCL |
-| I2C2_SDA | PB11 | ADXL345 SDA, VL53L0X SDA |
+| I2C2_SCL | PB10 | ADXL345 SCL |
+| I2C2_SDA | PB11 | ADXL345 SDA |
 
-ADXL345 ALT ADDRESS low selects 7-bit address `0x53`; the driver also tries `0x1D`. VL53L0X uses the default 7-bit address `0x29`.
+ADXL345 ALT ADDRESS low selects 7-bit address `0x53`; the driver also tries `0x1D`.
 
 ## SPI1 — RC522 and the single bidirectional nRF24L01
 
@@ -121,8 +121,8 @@ The F103 and F407 radios use channel 76, 1 Mbit/s, dynamic payloads and the same
 | SPI3 RX | DMA1 Stream 2 |
 | SPI3 TX | DMA1 Stream 5 |
 
-I2C2 has separate RX and TX streams available to the dispatcher. The current
-hardware test uses ADXL345 and VL53L0X on this bus.
+I2C2 has separate RX and TX streams available to the dispatcher. The video
+configuration uses ADXL345 on this bus.
 
 ## Enabled interrupts
 

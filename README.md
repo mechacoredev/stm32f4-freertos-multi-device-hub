@@ -7,7 +7,7 @@ The current full configuration contains:
 | Interface | Devices / node | Execution model |
 |---|---|---|
 | I2C1 | BME280, MPU6500 | Event/error IRQ state machine; RX data phase uses DMA |
-| I2C2 | ADXL345, VL53L0X | Periodic RX DMA for acceleration and ToF ranging results |
+| I2C2 | ADXL345 | Periodic RX DMA for acceleration data |
 | SPI1 | RC522, one bidirectional nRF24L01 | Shared bus; a single radio-owner task serializes NRF RX/TX mode changes |
 | SPI3 | ILI9341 TFT1, ILI9341 TFT2, SSD1306 SPI | Shared bus, separate CS pins, interrupt/DMA transfers |
 | CAN2 | STM32F103 node through two SN65HVD230 transceivers | Register-level bxCAN, TX/RX/error interrupts |
@@ -42,7 +42,7 @@ flowchart LR
     CANM --> CAN2[bxCAN2]
 
     I2C1 --> I2CDevices[BME280 / MPU6500]
-    I2C2 --> I2C2Devices[ADXL345 / VL53L0X]
+    I2C2 --> I2C2Devices[ADXL345]
     SPI1 --> SPI1Devices[RC522 / one bidirectional nRF]
     SPI3 --> SPI3Devices[TFT1 / TFT2 / SSD1306 SPI]
     CAN2 --> PHY1[SN65HVD230]
@@ -145,10 +145,6 @@ Recovery success means more than “the reset function returned”: the correspo
 - `rc522_display_data`
 - `ili9341_dma_success_count`
 - `ili9341_dma_error_count`
-- `vl53l0x_display_data`
-- `g_vl53l0x_debug`
-- `vl53l0x_dma_success_count`
-- `vl53l0x_dma_error_count`
 - `ssd1306_spi_refresh_count`
 - `g_can2_debug`
 - `g_can2_last_tx_frame`
@@ -175,24 +171,21 @@ The current workspace builds with:
 - STM32Cube FW_F4 V1.28.3
 - FreeRTOS through CMSIS-RTOS v2
 
-The current checkout is in staged I2C-only test mode (`I2C_ONLY_TEST = 1`,
-`CAN2_RUNTIME_ENABLED = 0`). SPI/CAN/NRF source code remains present but those
-tasks are not created. Latest local Debug build:
+The checked-in F407 configuration enables the complete video setup
+(`I2C_ONLY_TEST = 0`, `CAN2_RUNTIME_ENABLED = 1`), including I2C, SPI, NRF and
+CAN tasks. A clean build is required before publishing each revision.
 
 ```text
-text   69228
-data     180
-bss    52812
-total 122220 bytes
-0 errors, 0 warnings
+STM32F407: text 100260, data 132, bss 79460 — 0 errors, 0 warnings
+STM32F103: text  15192, data  12, bss  2004 — 0 errors, 0 warnings
 ```
-
-The complete configuration was also compiled successfully before selecting
-the staged I2C-only profile.
 
 ## Validation status
 
-The earlier configuration passed a 15-minute assembled-hardware smoke test. The expanded revision in this repository adds I2C2, ADXL345, VL53L0X, an SPI SSD1306 transport and changes the F407 radio topology from two NRF modules to one bidirectional SPI1 NRF. This expanded wiring revision builds cleanly but still requires staged hardware validation.
+The configuration shown in the published demonstration video uses BME280,
+MPU6500, ADXL345, RC522, one nRF24L01, two ILI9341 displays, one SPI SSD1306 and
+one SN65HVD230 on the STM32F407 side. The STM32F103 companion uses one
+nRF24L01 and one SN65HVD230.
 
 This is a successful integration/smoke test, not a long-duration endurance or product-qualification test. Multi-hour operation and extended repeated fault injection remain to be documented.
 
@@ -201,7 +194,7 @@ Use [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) for the staged validation p
 ## Current limitations
 
 - CAN filtering is currently accept-all rather than application-specific.
-- The newly expanded I2C2/VL53L0X/ADXL345 and single-NRF integration has not yet completed its hardware smoke test.
+- The demonstrated configuration has not yet completed a multi-hour endurance test.
 - Extended repeated multi-bus fault-injection results are not yet recorded.
 - The project is a development/learning platform, not a certified safety product.
 
@@ -211,12 +204,11 @@ Use [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) for the staged validation p
 - `Core/Src/spi_manager.c`, `Core/Inc/spi_manager.h`: SPI DMA manager and recovery
 - `Core/Src/can_manager.c`, `Core/Inc/can_manager.h`: register-level bxCAN manager
 - `Core/Src/adxl345.c`, `Core/Inc/adxl345.h`: I2C2 ADXL345 initialization and RX-DMA job construction
-- `Core/Src/vl53l0x.c`, `Core/Inc/vl53l0x.h`: I2C2 VL53L0X initialization, calibration and RX-DMA ranging results
 - `Core/Src/ssd1306_i2c.c`, `Core/Inc/ssd1306_i2c.h`: retained I2C SSD1306 driver for later reuse
 - `Core/Src/ssd1306_spi.c`, `Core/Inc/ssd1306_spi.h`: SPI SSD1306 framebuffer and DMA jobs
 - `Core/Src/system_health.c`, `Core/Inc/system_health.h`: health state and recovery bookkeeping
 - `Core/Src/main.c`: generated initialization, RTOS task wiring and application integration
-- `companion/arduino_uno_nrf24_node`: Arduino Uno + second NRF24L01 companion sketch
-- `../f103deneme`: STM32F103 HAL CAN companion project (kept beside this project in the workspace)
+- repository root: STM32F407 FreeRTOS multi-device hub project
+- `f103deneme`: STM32F103 HAL companion project for CAN and nRF24L01
 - `PIN_MAP.md`: authoritative connection map for this revision
 - `HARDWARE_VALIDATION.md`: hardware test checklist

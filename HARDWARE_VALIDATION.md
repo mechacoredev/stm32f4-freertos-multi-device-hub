@@ -18,7 +18,6 @@ Use this checklist in order. A clean build is only the starting point; each stag
 
 Start with `is_mcu_reset_allowed = false` so diagnostics remain visible instead of immediately rebooting.
 
-- [ ] In the current I2C-only stage, leave STM32F103, CAN, SPI and NRF hardware disconnected.
 - [ ] Start the STM32F407 Debug build.
 - [ ] Confirm every enabled task reaches its normal loop.
 - [ ] Confirm no HardFault, assert or unexpected reset.
@@ -58,19 +57,12 @@ Fault injection:
 Observe:
 
 - `adxl345_display_data`
-- `vl53l0x_display_data`
-- `g_vl53l0x_debug`
-- `vl53l0x_dma_success_count`
-- `vl53l0x_dma_error_count`
 - the I2C2 entry in `g_system_bus_health`
 
 Tests:
 
 - [ ] ADXL345 X/Y/Z data updates approximately every 100 ms.
-- [ ] `g_vl53l0x_debug.init_stage` reaches 6 and identification values are `EE/AA/10`.
-- [ ] VL53L0X distance changes as a target is moved in front of the sensor.
-- [ ] `vl53l0x_display_data.update_count` and `vl53l0x_dma_success_count` increase.
-- [ ] I2C1 continues updating while both I2C2 sensors are active.
+- [ ] I2C1 continues updating while the I2C2 sensor is active.
 - [ ] Disconnect and reconnect one I2C2 signal; confirm local recovery and resumed valid traffic.
 
 ## 5. SPI1 validation
@@ -78,7 +70,7 @@ Tests:
 Devices: RC522 and the single bidirectional nRF24L01.
 
 - [ ] RC522 operations complete and its display/debug data updates.
-- [ ] nRF24L01 receives packets from Arduino Uno and transmits through the same radio.
+- [ ] nRF24L01 receives packets from STM32F103 and transmits through the same radio.
 - [ ] CS/CSN lines never overlap.
 - [ ] DMA/IRQ success counts increase without error growth.
 - [ ] Disconnect and reconnect each device separately.

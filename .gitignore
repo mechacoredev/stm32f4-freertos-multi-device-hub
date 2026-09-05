@@ -1,6 +1,8 @@
 # STM32CubeIDE build output
 /Debug/
 /Release/
+**/Debug/
+**/Release/
 *.elf
 *.hex
 *.bin
@@ -15,6 +17,7 @@
 # Local debugger and IDE state
 *.launch
 .settings/com.st.stm32cube.ide.mcu.sfrview.prefs
+**/.settings/com.st.stm32cube.ide.mcu.sfrview.prefs
 .metadata/
 RemoteSystemsTempFiles/
 

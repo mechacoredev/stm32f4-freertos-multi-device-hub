@@ -31,7 +31,6 @@
 #include "string.h"
 #include "can_manager.h"
 #include "adxl345.h"
-#include "vl53l0x.h"
 #include "ssd1306_spi.h"
 #include "stdio.h"
 /* USER CODE END Includes */
@@ -107,15 +106,6 @@ typedef struct{
   bool valid;
   uint32_t update_count;
 }adxl345_display_data_t;
-
-typedef struct{
-  uint16_t distance_mm;
-  uint8_t range_status;
-  bool valid;
-  uint32_t update_count;
-  uint32_t last_success_tick;
-  uint32_t error_count;
-}vl53l0x_display_data_t;
 
 typedef struct{
   uint32_t scl_level;
@@ -237,14 +227,12 @@ typedef struct{
 #define MPU6500_ALL_FLAGS        0x07
 #define ADXL345_DMA_SUCCESS_FLAG 0x01
 #define ADXL345_DMA_ERROR_FLAG   0x02
-#define VL53L0X_DMA_SUCCESS_FLAG 0x01
-#define VL53L0X_DMA_ERROR_FLAG   0x02
 #define SSD1306_SPI_SUCCESS_FLAG 0x01
 #define SSD1306_SPI_ERROR_FLAG   0x02
 
 #define MPU6500_USE_DATA_READY_INTERRUPT 1
 #define I2C1_SENSOR_CLIENT_COUNT 2
-#define I2C2_SENSOR_CLIENT_COUNT 2
+#define I2C2_SENSOR_CLIENT_COUNT 1
 #define I2C_SENSOR_ERROR_BACKOFF_MS 50
 #define SENSOR_DATA_STALE_TIMEOUT_MS 2000
 #define RC522_LIVENESS_CHECK_PERIOD_MS 1000
@@ -269,7 +257,6 @@ typedef struct{
 #define SPI_STALE_NRF_RX_MASK 0x10
 #define SPI_STALE_DISPLAY_MASK 0x20
 #define SENSOR_STALE_ADXL345_MASK 0x40
-#define SENSOR_STALE_VL53L0X_MASK 0x80
 #define SPI_STALE_SSD1306_MASK 0x100
 
 /* Tam sistem dogrulamasi: I2C sensorleri, SPI1 RC522/tek NRF, SPI3 iki
@@ -303,8 +290,7 @@ typedef struct{
   (SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_BME280) | \
    SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_MPU6500) | \
    SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_I2C_DISPATCH) | \
-   SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_ADXL345) | \
-   SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_VL53L0X))
+   SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_ADXL345))
 #else
 #define ACTIVE_HEALTH_MASK \
   (SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_BME280) | \
@@ -315,7 +301,6 @@ typedef struct{
    NRF_HEALTH_TASK_MASK | \
    SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_DISPLAY) | \
    SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_ADXL345) | \
-   SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_VL53L0X) | \
    SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_SSD1306_SPI) | \
    CAN_HEALTH_TASK_MASK)
 #endif
@@ -407,15 +392,10 @@ const osThreadAttr_t CAN2WriteTask_attributes = {
   .stack_size = 256 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
-/* Definitions for ADXL345 and VL53L0X tasks */
+/* Definitions for ADXL345 task */
 osThreadId_t adxl345taskHandle;
 const osThreadAttr_t adxl345task_attributes = {
   .name = "adxl345task", .stack_size = 384 * 4,
-  .priority = (osPriority_t) osPriorityNormal,
-};
-osThreadId_t vl53l0xtaskHandle;
-const osThreadAttr_t vl53l0xtask_attributes = {
-  .name = "vl53l0xtask", .stack_size = 512 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
 osThreadId_t ssd1306spitaskHandle;
@@ -503,19 +483,14 @@ uint8_t nrf_pending_tx[NRF24L01_PAYLOAD_SIZE] = {0};
 uint8_t nrf_pending_tx_length = 0;
 volatile bool nrf_tx_request_pending = false;
 adxl345_handle_t my_adxl345 = NULL;
-vl53l0x_handle_t my_vl53l0x = NULL;
 ssd1306_spi_handle_t my_ssd1306_spi = NULL;
 adxl345_display_data_t adxl345_display_data = {0};
 volatile bool adxl345_init_completed = false;
-volatile bool vl53l0x_init_completed = false;
 volatile bool ssd1306_spi_init_completed = false;
 volatile uint32_t adxl345_dma_success_count = 0;
 volatile uint32_t adxl345_dma_error_count = 0;
-volatile uint32_t vl53l0x_dma_success_count = 0;
-volatile uint32_t vl53l0x_dma_error_count = 0;
 volatile uint32_t ssd1306_spi_refresh_count = 0;
 volatile uint32_t adxl345_last_success_tick = 0;
-volatile uint32_t vl53l0x_last_success_tick = 0;
 volatile uint32_t ssd1306_spi_last_success_tick = 0;
 volatile uint32_t nrf_tx_success_count = 0;
 volatile uint32_t nrf_tx_error_count = 0;
@@ -570,7 +545,6 @@ nrf24l01_display_data_t nrf24l01_display_data = {0};
 rc522_display_data_t rc522_display_data = {0};
 can_display_data_t can_display_data = {0};
 volatile communication_link_debug_t g_communication_link_debug = {0};
-volatile vl53l0x_display_data_t vl53l0x_display_data = {0};
 volatile bool bme280_init_completed = false;
 volatile bool mpu6500_init_completed = false;
 volatile uint32_t mpu6500_dma_success_count = 0;
@@ -633,7 +607,6 @@ void starthealthtask(void *argument);
 void StartCAN2ReadTask(void *argument);
 void StartCAN2WriteTask(void *argument);
 void startadxl345task(void *argument);
-void startvl53l0xtask(void *argument);
 void startssd1306spitask(void *argument);
 
 /* USER CODE BEGIN PFP */
@@ -1046,7 +1019,6 @@ static void register_i2c_sensor_client_ready(I2C_TypeDef* i2c){
       i2c2_runtime_ready = true;
       i2c_runtime_start_count++;
       osThreadFlagsSet(adxl345taskHandle, I2C_RUNTIME_READY_FLAG);
-      osThreadFlagsSet(vl53l0xtaskHandle, I2C_RUNTIME_READY_FLAG);
     }
   }
   i2c_runtime_ready = i2c1_runtime_ready && i2c2_runtime_ready;
@@ -1608,8 +1580,6 @@ int main(void)
 
   adxl345taskHandle = osThreadNew(startadxl345task, NULL,
           &adxl345task_attributes);
-  vl53l0xtaskHandle = osThreadNew(startvl53l0xtask, NULL,
-          &vl53l0xtask_attributes);
 #if !I2C_ONLY_TEST
   ssd1306spitaskHandle = osThreadNew(startssd1306spitask, NULL,
           &ssd1306spitask_attributes);
@@ -1630,7 +1600,6 @@ int main(void)
   system_health_register_task(HEALTH_TASK_SSD1306_SPI, ssd1306spitaskHandle);
 #endif
   system_health_register_task(HEALTH_TASK_ADXL345, adxl345taskHandle);
-  system_health_register_task(HEALTH_TASK_VL53L0X, vl53l0xtaskHandle);
 #if CAN2_RUNTIME_ENABLED
   system_health_register_task(HEALTH_TASK_CAN_RX, CAN2ReadTaskHandle);
   system_health_register_task(HEALTH_TASK_CAN_TX, CAN2WriteTaskHandle);
@@ -2440,7 +2409,6 @@ void starti2cdmatask(void *argument)
                 _i2c_manager_ok;
         if(i2c2_ready){
           osThreadFlagsSet(adxl345taskHandle, I2C_WORKER_READY_FLAG);
-          osThreadFlagsSet(vl53l0xtaskHandle, I2C_WORKER_READY_FLAG);
           i2c2_workers_released = true;
         }
       }
@@ -3682,111 +3650,6 @@ void startadxl345task(void *argument)
   /* USER CODE END startadxl345task */
 }
 
-/* USER CODE BEGIN Header_startvl53l0xtask */
-/* Periodic VL53L0X I2C2 ranging task. Result block is read with RX-DMA. */
-/* USER CODE END Header_startvl53l0xtask */
-void startvl53l0xtask(void *argument)
-{
-  /* USER CODE BEGIN startvl53l0xtask */
-  (void)argument;
-  uint32_t ready = osThreadFlagsWait(I2C_WORKER_READY_FLAG,
-          osFlagsWaitAny, osWaitForever);
-  if((ready & I2C_WORKER_READY_FLAG) == 0) for(;;) osDelay(1000);
-
-  vl53l0x_config_t config = {
-    .i2c_handle = I2C2,
-    .dma_handle = DMA1,
-    .dma_stream = LL_DMA_STREAM_3,
-    .i2c_address = VL53L0X_I2C_ADDRESS
-  };
-
-  /* Sensor ilk acilista NACK verirse task'i kalici olarak oldurmek yerine
-   * kontrollu araliklarla yeniden dene. Bu sirada ADXL345 calismaya devam
-   * eder ve Live Expressions son NACK fazini gosterebilir. */
-  while(my_vl53l0x == NULL){
-    system_health_heartbeat(HEALTH_TASK_VL53L0X);
-    if(!acquire_i2c_init_lock()){
-      osDelay(1000);
-      continue;
-    }
-    my_vl53l0x = vl53l0x_init(&config);
-    release_i2c_init_lock();
-    if(my_vl53l0x == NULL) osDelay(1000);
-  }
-  vl53l0x_init_completed = true;
-  vl53l0x_last_success_tick = osKernelGetTickCount();
-  register_i2c_sensor_client_ready(I2C2);
-
-  uint32_t next_poll_tick = osKernelGetTickCount();
-  for(;;){
-    system_health_heartbeat(HEALTH_TASK_VL53L0X);
-    next_poll_tick += 50;
-
-    bool measurement_ready = false;
-    vl53l0x_status_t sensor_status = vl53l0x_is_data_ready(
-            my_vl53l0x, &measurement_ready);
-    if(sensor_status != VL53L0X_OK){
-      vl53l0x_dma_error_count++;
-      vl53l0x_display_data.error_count++;
-      system_health_bus_record_failure(SYSTEM_BUS_I2C2,
-              (int32_t)sensor_status);
-      osDelayUntil(next_poll_tick);
-      continue;
-    }
-    if(!measurement_ready){
-      osDelayUntil(next_poll_tick);
-      continue;
-    }
-
-    osThreadFlagsClear(VL53L0X_DMA_SUCCESS_FLAG | VL53L0X_DMA_ERROR_FLAG);
-    i2c_job_t job;
-    if(vl53l0x_build_read_job(my_vl53l0x, vl53l0xtaskHandle,
-            VL53L0X_DMA_SUCCESS_FLAG, VL53L0X_DMA_ERROR_FLAG, &job) !=
-            VL53L0X_OK || submit_i2c_dma_job(&job) != osOK){
-      vl53l0x_dma_error_count++;
-      vl53l0x_display_data.error_count++;
-      osDelayUntil(next_poll_tick);
-      continue;
-    }
-
-    uint32_t flags = osThreadFlagsWait(VL53L0X_DMA_SUCCESS_FLAG |
-            VL53L0X_DMA_ERROR_FLAG, osFlagsWaitAny, 1000);
-    if((flags & osFlagsError) != 0 ||
-       (flags & VL53L0X_DMA_SUCCESS_FLAG) == 0){
-      vl53l0x_dma_error_count++;
-      vl53l0x_display_data.error_count++;
-      system_health_bus_record_failure(SYSTEM_BUS_I2C2,
-              _i2c_manager_dma_error);
-      osDelayUntil(next_poll_tick);
-      continue;
-    }
-
-    vl53l0x_measurement_t measurement = {0};
-    sensor_status = vl53l0x_process_data(my_vl53l0x, &measurement);
-    if(sensor_status == VL53L0X_OK &&
-       vl53l0x_clear_interrupt(my_vl53l0x) == VL53L0X_OK){
-      uint32_t now = osKernelGetTickCount();
-      vl53l0x_display_data.distance_mm = measurement.distance_mm;
-      vl53l0x_display_data.range_status = measurement.range_status;
-      vl53l0x_display_data.valid = measurement.valid;
-      vl53l0x_display_data.update_count++;
-      vl53l0x_display_data.last_success_tick = now;
-      vl53l0x_dma_success_count++;
-      vl53l0x_last_success_tick = now;
-      system_health_bus_record_success(SYSTEM_BUS_I2C2,
-              SYSTEM_SOURCE_VL53L0X, SYSTEM_OPERATION_READ,
-              config.i2c_address, measurement.distance_mm);
-    }else{
-      vl53l0x_dma_error_count++;
-      vl53l0x_display_data.error_count++;
-      system_health_bus_record_failure(SYSTEM_BUS_I2C2,
-              (int32_t)sensor_status);
-    }
-    osDelayUntil(next_poll_tick);
-  }
-  /* USER CODE END startvl53l0xtask */
-}
-
 /* USER CODE BEGIN Header_startssd1306spitask */
 /* SPI3 SSD1306 framebuffer DMA task. */
 /* USER CODE END Header_startssd1306spitask */
@@ -4090,10 +3953,6 @@ void starthealthtask(void *argument)
        (now - adxl345_last_success_tick) >= SENSOR_DATA_STALE_TIMEOUT_MS){
       stale_mask |= SENSOR_STALE_ADXL345_MASK;
     }
-    if(vl53l0x_init_completed &&
-       (now - vl53l0x_last_success_tick) >= SENSOR_DATA_STALE_TIMEOUT_MS){
-      stale_mask |= SENSOR_STALE_VL53L0X_MASK;
-    }
     if(!I2C_ONLY_TEST && ssd1306_spi_init_completed &&
        (now - ssd1306_spi_last_success_tick) >=
                DISPLAY_PROGRESS_STALE_TIMEOUT_MS){
@@ -4132,7 +3991,7 @@ void starthealthtask(void *argument)
       }
 #endif
 
-      if((!adxl345_init_completed || !vl53l0x_init_completed) &&
+      if(!adxl345_init_completed &&
          (g_system_bus_health[SYSTEM_BUS_I2C2].state == SYSTEM_BUS_STATE_OK)){
         system_health_bus_record_failure(SYSTEM_BUS_I2C2,
                 (int32_t)i2c_manager_last_result(I2C2));
@@ -4165,8 +4024,7 @@ void starthealthtask(void *argument)
         system_health_bus_record_failure(SYSTEM_BUS_SPI1, _spi_manager_timeout);
       }
     }
-    if((stale_mask & (SENSOR_STALE_ADXL345_MASK |
-            SENSOR_STALE_VL53L0X_MASK)) != 0){
+    if((stale_mask & SENSOR_STALE_ADXL345_MASK) != 0){
       if(g_system_bus_health[SYSTEM_BUS_I2C2].state == SYSTEM_BUS_STATE_OK){
         system_health_bus_record_failure(SYSTEM_BUS_I2C2,
                 (int32_t)i2c_manager_last_result(I2C2));
@@ -4191,8 +4049,7 @@ void starthealthtask(void *argument)
     system_health_bus_refresh_ages(now);
     supervise_faulted_buses(now);
     bool subsystems_initialized = bme280_init_completed &&
-            mpu6500_init_completed && adxl345_init_completed &&
-            vl53l0x_init_completed;
+            mpu6500_init_completed && adxl345_init_completed;
 #if CAN2_RUNTIME_ENABLED && WATCHDOG_MONITOR_CAN
     subsystems_initialized = subsystems_initialized &&
             (g_can2_debug.initialized != 0);
@@ -4229,8 +4086,7 @@ void starthealthtask(void *argument)
         }
         if(index == SYSTEM_BUS_I2C2){
           tolerated_missing_heartbeat_mask |=
-                  SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_ADXL345) |
-                  SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_VL53L0X);
+                  SYSTEM_HEALTH_TASK_MASK(HEALTH_TASK_ADXL345);
         }
         if(index == SYSTEM_BUS_SPI1){
           tolerated_missing_heartbeat_mask |=
