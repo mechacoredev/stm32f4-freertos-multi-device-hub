@@ -117,7 +117,11 @@ Fault injection:
 
 ## 8. Full simultaneous-load test
 
-Current result: **Passed for 15 minutes** with the complete connected configuration. All enabled devices operated as expected during that observation window. The individual evidence items below should still be retained for repeatable future test records.
+Current result: the complete connected configuration is shown in an
+[approximately 5-minute demonstration video](https://www.youtube.com/watch?v=anP3AZDGQVM)
+and separately **passed a 15-minute continuous integration test**. All enabled
+devices operated as expected during that observation window. The individual
+evidence items below should still be retained for repeatable future test records.
 
 - [ ] Enable all sensor, radio, display and CAN tasks.
 - [ ] Run I2C1, I2C2, SPI1, SPI3 and CAN2 concurrently.

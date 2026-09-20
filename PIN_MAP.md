@@ -2,7 +2,9 @@
 
 Target board: STM32F407G-DISC1 / STM32F407VGTx.
 
-This file reflects the current `.ioc` configuration. It supersedes the older map that placed the ILI9341 displays on SPI2.
+This file reflects the current
+`stm32f4-freertos-multi-device-hub-main/LL_multi_device.ioc` configuration. It
+supersedes the older map that placed the ILI9341 displays on SPI2.
 
 ## I2C1
 

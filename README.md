@@ -14,6 +14,17 @@ The current full configuration contains:
 
 The STM32F103 test node is kept intentionally simple and uses HAL. The STM32F407 side is the system under study.
 
+## Demonstration video
+
+[Watch the approximately 5-minute hardware demonstration on YouTube](https://www.youtube.com/watch?v=anP3AZDGQVM)
+
+The video shows the complete STM32F407/STM32F103 configuration running under
+FreeRTOS, live sensor/display updates and recovery after selected sensor,
+nRF24L01 and CAN connections are interrupted and restored. Sensor register
+initialization is performed with polling transfers; normal runtime sensor data
+acquisition uses interrupt-driven state machines and DMA. MPU6500 sampling is
+started from its data-ready interrupt.
+
 ## Design goals
 
 - Keep sensor tasks independent from peripheral register access.
@@ -187,7 +198,11 @@ MPU6500, ADXL345, RC522, one nRF24L01, two ILI9341 displays, one SPI SSD1306 and
 one SN65HVD230 on the STM32F407 side. The STM32F103 companion uses one
 nRF24L01 and one SN65HVD230.
 
-This is a successful integration/smoke test, not a long-duration endurance or product-qualification test. Multi-hour operation and extended repeated fault injection remain to be documented.
+The published demonstration is approximately 5 minutes long. In addition, the
+same complete connected configuration passed a separate 15-minute continuous
+integration test with all enabled devices operating as expected. These are
+successful integration/smoke tests, not long-duration endurance or product
+qualification. Multi-hour operation remains to be documented.
 
 Use [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) for the staged validation procedure. Do not treat a successful build as proof of electrical or long-duration stability.
 
@@ -200,15 +215,12 @@ Use [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) for the staged validation p
 
 ## Repository guide
 
-- `Core/Src/i2c_manager.c`, `Core/Inc/i2c_manager.h`: I2C state machine, DMA receive and recovery
-- `Core/Src/spi_manager.c`, `Core/Inc/spi_manager.h`: SPI DMA manager and recovery
-- `Core/Src/can_manager.c`, `Core/Inc/can_manager.h`: register-level bxCAN manager
-- `Core/Src/adxl345.c`, `Core/Inc/adxl345.h`: I2C2 ADXL345 initialization and RX-DMA job construction
-- `Core/Src/ssd1306_i2c.c`, `Core/Inc/ssd1306_i2c.h`: retained I2C SSD1306 driver for later reuse
-- `Core/Src/ssd1306_spi.c`, `Core/Inc/ssd1306_spi.h`: SPI SSD1306 framebuffer and DMA jobs
-- `Core/Src/system_health.c`, `Core/Inc/system_health.h`: health state and recovery bookkeeping
-- `Core/Src/main.c`: generated initialization, RTOS task wiring and application integration
-- repository root: STM32F407 FreeRTOS multi-device hub project
-- `f103deneme`: STM32F103 HAL companion project for CAN and nRF24L01
+- `stm32f4-freertos-multi-device-hub-main`: complete STM32F407 FreeRTOS project
+- `f103deneme`: complete STM32F103 HAL companion project for CAN and nRF24L01
+- `stm32f4-freertos-multi-device-hub-main/Core/Src/i2c_manager.c`: I2C state machine, DMA receive and recovery
+- `stm32f4-freertos-multi-device-hub-main/Core/Src/spi_manager.c`: SPI DMA manager and recovery
+- `stm32f4-freertos-multi-device-hub-main/Core/Src/can_manager.c`: register-level bxCAN manager
+- `stm32f4-freertos-multi-device-hub-main/Core/Src/ssd1306_i2c.c`: retained for later reuse; it is not active in the demonstrated configuration
+- `stm32f4-freertos-multi-device-hub-main/Core/Src/ssd1306_spi.c`: active SPI SSD1306 framebuffer and DMA transport
 - `PIN_MAP.md`: authoritative connection map for this revision
 - `HARDWARE_VALIDATION.md`: hardware test checklist
